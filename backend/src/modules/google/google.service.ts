@@ -3,7 +3,7 @@ import type { ConnectedAccount, ProviderConfig } from '@prisma/client'
 import { prisma } from '../../config/prisma.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 
-const googleDriveFolderMimeType = 'application/vnd.google-apps.folder'
+export const googleDriveFolderMimeType = 'application/vnd.google-apps.folder'
 const appFolderName = '9drive'
 
 export function createOAuthClient(config: ProviderConfig) {
@@ -102,53 +102,89 @@ type DriveFileMetadata = {
   name: string
   mimeType: string
   sizeBytes: bigint
+  parentIds: string[]
 }
+
+const defaultFolderColor = '#3b82f6'
+const defaultFolderIconUrl = 'https://api.iconify.design/lucide:folder.svg'
 
 export async function syncGoogleAppFolderFiles(accountId: string, userId: string): Promise<GoogleAppFolderSyncResult> {
   const account = await prisma.connectedAccount.findFirstOrThrow({ where: { id: accountId, userId, provider: 'google_drive', status: 'connected' } })
   const auth = await getAuthedGoogleClient(account)
   const drive = google.drive({ version: 'v3', auth })
-  const appFolderId = await ensureGoogleAppFolder(account)
   const driveFiles: DriveFileMetadata[] = []
+  const driveFolders: Array<{ id: string; name: string }> = []
   let pageToken: string | undefined
 
   do {
     const response = await drive.files.list({
-      q: `'${appFolderId}' in parents and mimeType != '${googleDriveFolderMimeType}' and trashed = false`,
+      q: `trashed = false`,
       spaces: 'drive',
-      fields: 'nextPageToken,files(id,name,mimeType,size)',
+      fields: 'nextPageToken,files(id,name,mimeType,size,parents)',
       pageSize: 1000,
       pageToken,
     })
     for (const file of response.data.files ?? []) {
       if (!file.id || !file.name || !file.mimeType) continue
-      driveFiles.push({ id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: BigInt(file.size ?? 0) })
+      if (file.mimeType === googleDriveFolderMimeType) {
+        driveFolders.push({ id: file.id, name: file.name })
+      } else {
+        driveFiles.push({ id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: BigInt(file.size ?? 0), parentIds: (file.parents ?? []).filter((p): p is string => typeof p === 'string') })
+      }
     }
     pageToken = response.data.nextPageToken ?? undefined
   } while (pageToken)
 
-  const existingFiles = await prisma.file.findMany({ where: { userId, connectedAccountId: account.id, provider: 'google_drive' } })
-  const existingByProviderId = new Map(existingFiles.map((file) => [file.providerFileId, file]))
-  const driveFileIds = new Set(driveFiles.map((file) => file.id))
+  await ensureGoogleAppFolder(account)
+
+  const existingFolders = await prisma.folder.findMany({ where: { userId, connectedAccountId: account.id, deletedAt: null } })
+  const existingFolderByProviderId = new Map(existingFolders.map((folder) => [folder.providerFolderId, folder]))
+  const driveFolderIds = new Set(driveFolders.map((folder) => folder.id))
   let created = 0
   let updated = 0
   let deleted = 0
 
+  for (const driveFolder of driveFolders) {
+    const existing = existingFolderByProviderId.get(driveFolder.id)
+    if (!existing) {
+      const createdFolder = await prisma.folder.create({
+        data: { userId, connectedAccountId: account.id, provider: 'google_drive', providerFolderId: driveFolder.id, name: driveFolder.name, color: defaultFolderColor, iconUrl: defaultFolderIconUrl },
+      })
+      existingFolderByProviderId.set(driveFolder.id, createdFolder)
+      created += 1
+    } else if (existing.name !== driveFolder.name) {
+      await prisma.folder.update({ where: { id: existing.id }, data: { name: driveFolder.name } })
+      updated += 1
+    }
+  }
+
+  const missingFolderIds = existingFolders.filter((folder) => folder.providerFolderId && !driveFolderIds.has(folder.providerFolderId)).map((folder) => folder.id)
+  if (missingFolderIds.length > 0) {
+    await prisma.folder.updateMany({ where: { id: { in: missingFolderIds }, userId }, data: { deletedAt: new Date() } })
+    deleted += missingFolderIds.length
+  }
+
+  const existingFiles = await prisma.file.findMany({ where: { userId, connectedAccountId: account.id, provider: 'google_drive' } })
+  const existingByProviderId = new Map(existingFiles.map((file) => [file.providerFileId, file]))
+  const driveFileIds = new Set(driveFiles.map((file) => file.id))
+
   for (const driveFile of driveFiles) {
+    const parentId = driveFile.parentIds.find((pid) => existingFolderByProviderId.has(pid))
+    const parentFolderId = parentId ? existingFolderByProviderId.get(parentId)!.id : null
     const existing = existingByProviderId.get(driveFile.id)
     if (!existing) {
       await prisma.file.create({
-        data: { userId, connectedAccountId: account.id, provider: 'google_drive', providerFileId: driveFile.id, name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, status: 'active' },
+        data: { userId, connectedAccountId: account.id, provider: 'google_drive', providerFileId: driveFile.id, name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, status: 'active', folderId: parentFolderId },
       })
       created += 1
       continue
     }
 
-    const needsUpdate = existing.name !== driveFile.name || existing.mimeType !== driveFile.mimeType || existing.sizeBytes !== driveFile.sizeBytes || existing.status !== 'active' || existing.deletedAt !== null
+    const needsUpdate = existing.name !== driveFile.name || existing.mimeType !== driveFile.mimeType || existing.sizeBytes !== driveFile.sizeBytes || existing.status !== 'active' || existing.deletedAt !== null || existing.folderId !== parentFolderId
     if (needsUpdate) {
       await prisma.file.update({
         where: { id: existing.id },
-        data: { name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, status: 'active', deletedAt: null },
+        data: { name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, status: 'active', deletedAt: null, folderId: parentFolderId },
       })
       updated += 1
     }

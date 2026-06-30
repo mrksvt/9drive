@@ -7,7 +7,18 @@ dist/
 backend/.env
 backend/.env.local
 backend/.env.*.local
-
-# Local env is non-secret by default, keep example in repo instead.
+frontend/.env
 frontend/.env.local
 frontend/.env.*.local
+client_secret*.json
+
+# IDE / Agent
+.omo/
+.opencode/
+
+# Screenshots / temp
+*.png
+Patch.md
+
+# PM2
+ecosystem.config.cjs

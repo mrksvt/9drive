@@ -5,11 +5,30 @@ import { prisma } from '../../config/prisma.js'
 import { env } from '../../config/env.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { hashToken, randomToken } from '../../utils/crypto.js'
-import { getAuthedGoogleClient, syncGoogleAppFolderFiles, syncGoogleQuota } from '../google/google.service.js'
+import { getAuthedGoogleClient, syncGoogleAppFolderFiles, syncGoogleQuota, googleDriveFolderMimeType } from '../google/google.service.js'
 import { deleteS3Object, syncS3Quota } from '../s3/s3.service.js'
 import { streamProviderFile } from './stream-file.js'
 
 export const fileRouter = Router()
+
+function getFileExtension(fileName: string): string {
+  const lastDot = fileName.lastIndexOf('.')
+  if (lastDot === -1 || lastDot === fileName.length - 1) return 'other'
+  const ext = fileName.slice(lastDot + 1).toLowerCase()
+  return ext || 'other'
+}
+
+function groupFilesByExtension(files: BackendFile[]): Record<string, BackendFile[]> {
+  const groups: Record<string, BackendFile[]> = {}
+  for (const file of files) {
+    const ext = getFileExtension(file.name)
+    if (!groups[ext]) groups[ext] = []
+    groups[ext].push(file)
+  }
+  return groups
+}
+
+type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: bigint; createdAt: Date; folderId?: string | null; connectedAccount?: { id: string; email: string; provider: string }; folder?: { id: string; name: string } | null }
 
 fileRouter.get('/preview/:token', async (req, res, next) => {
   try {
@@ -29,9 +48,30 @@ fileRouter.use(requireAuth)
 
 fileRouter.get('/', async (req: AuthRequest, res, next) => {
   try {
-    const query = z.object({ folderId: z.string().optional(), q: z.string().trim().max(255).optional() }).parse(req.query)
-    const files = await prisma.file.findMany({ where: { userId: req.user!.id, status: 'active', ...(query.folderId ? { folderId: query.folderId } : {}), ...(query.q ? { name: { contains: query.q } } : {}) }, include: { connectedAccount: { select: { id: true, email: true, provider: true } }, folder: { select: { id: true, name: true } } }, orderBy: { createdAt: 'desc' } })
-    return res.json({ files: files.map((file) => ({ ...file, sizeBytes: file.sizeBytes.toString() })) })
+    const query = z.object({ folderId: z.string().optional(), q: z.string().trim().max(255).optional(), autoSync: z.enum(['true', 'false']).optional() }).parse(req.query)
+    
+    if (query.autoSync === 'true') {
+      const accounts = await prisma.connectedAccount.findMany({
+        where: { userId: req.user!.id, provider: 'google_drive', status: 'connected' },
+        include: { storageAccount: true },
+      })
+      const staleAccounts = accounts.filter((account) => !account.storageAccount?.lastSyncedAt || account.storageAccount.lastSyncedAt.getTime() < Date.now() - 10 * 60_000)
+      if (staleAccounts.length > 0) {
+        for (const account of staleAccounts.slice(0, 2)) {
+          syncGoogleAppFolderFiles(account.id, req.user!.id).catch(() => undefined)
+        }
+      }
+    }
+    
+    const files = await prisma.file.findMany({ where: { userId: req.user!.id, status: 'active', mimeType: { not: googleDriveFolderMimeType }, ...(query.folderId ? { folderId: query.folderId } : {}), ...(query.q ? { name: { contains: query.q } } : {}) }, include: { connectedAccount: { select: { id: true, email: true, provider: true } }, folder: { select: { id: true, name: true } } }, orderBy: { createdAt: 'desc' } })
+    const mappedFiles = files.map((file) => ({ ...file, sizeBytes: file.sizeBytes.toString() }))
+    const grouped = groupFilesByExtension(files as unknown as BackendFile[])
+    const groups = Object.entries(grouped).map(([extension, groupFiles]) => ({
+      extension,
+      count: groupFiles.length,
+      files: groupFiles.map((file) => ({ ...file, sizeBytes: file.sizeBytes.toString() })),
+    }))
+    return res.json({ files: mappedFiles, groups })
   } catch (error) {
     return next(error)
   }
@@ -166,6 +206,26 @@ fileRouter.post('/:id/share', async (req: AuthRequest, res, next) => {
     const token = randomToken(32)
     const share = await prisma.fileShare.create({ data: { fileId: file.id, userId: req.user!.id, token, tokenHash: hashToken(token) } })
     return res.status(201).json({ url: `${env.FRONTEND_URL}/public/files/${token}`, shareId: share.id })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+fileRouter.post('/:id/share-drive', async (req: AuthRequest, res, next) => {
+  try {
+    const fileId = String(req.params.id)
+    const body = z.object({ access: z.enum(['public', 'email']).default('public'), email: z.string().email().optional() }).parse(req.body)
+    const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id, status: 'active' }, include: { connectedAccount: true } })
+    if (file.provider !== 'google_drive') return res.status(400).json({ code: 'NOT_GOOGLE_DRIVE', message: 'Google Drive sharing is only available for Google Drive files.' })
+    const auth = await getAuthedGoogleClient(file.connectedAccount)
+    const drive = google.drive({ version: 'v3', auth })
+    if (body.access === 'public') {
+      await drive.permissions.create({ fileId: file.providerFileId, requestBody: { role: 'reader', type: 'anyone' } }).catch(() => undefined)
+    } else if (body.access === 'email' && body.email) {
+      await drive.permissions.create({ fileId: file.providerFileId, requestBody: { role: 'reader', type: 'user', emailAddress: body.email } })
+    }
+    const metadata = await drive.files.get({ fileId: file.providerFileId, fields: 'webViewLink,webContentLink' })
+    return res.json({ url: metadata.data.webViewLink ?? metadata.data.webContentLink })
   } catch (error) {
     return next(error)
   }

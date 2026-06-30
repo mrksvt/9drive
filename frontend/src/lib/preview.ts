@@ -1,4 +1,4 @@
-export type PreviewKind = 'image' | 'video' | 'document' | 'office'
+export type PreviewKind = 'image' | 'video' | 'document' | 'office' | 'google-native'
 
 const officeMimeTypes = new Set([
   'application/msword',
@@ -19,9 +19,18 @@ export function getPreviewKind(mimeType: string | undefined): PreviewKind | null
   if (!mimeType) return null
   if (mimeType.startsWith('image/') || mimeType === 'application/vnd.google-apps.drawing') return 'image'
   if (mimeType.startsWith('video/')) return 'video'
-  if (mimeType === 'application/pdf' || googleDocumentMimeTypes.has(mimeType)) return 'document'
+  if (mimeType === 'application/pdf') return 'document'
   if (officeMimeTypes.has(mimeType)) return 'office'
+  if (googleDocumentMimeTypes.has(mimeType)) return 'google-native'
   return null
+}
+
+export function isGoogleNativeDoc(mimeType: string | undefined): boolean {
+  return googleDocumentMimeTypes.has(mimeType ?? '')
+}
+
+export function isOfficeDoc(mimeType: string | undefined): boolean {
+  return officeMimeTypes.has(mimeType ?? '')
 }
 
 export function officeViewerUrl(fileUrl: string) {

@@ -47,8 +47,29 @@ export async function streamGoogleFile(file: FileWithAccount, range: string | un
   })
 
   if (!response.ok) {
-    const message = await response.text().catch(() => response.statusText)
-    return res.status(response.status).json({ code: 'GOOGLE_FILE_STREAM_FAILED', message: message || response.statusText })
+    const text = await response.text().catch(() => response.statusText)
+    if (!exportTarget && response.status === 403) {
+      const pdfUrl = `https://www.googleapis.com/drive/v3/files/${file.providerFileId}/export?mimeType=${encodeURIComponent('application/pdf')}`
+      const pdfResponse = await fetch(pdfUrl, { headers })
+      if (pdfResponse.ok) {
+        res.status(pdfResponse.status)
+        res.setHeader('Content-Type', 'application/pdf')
+        res.setHeader('Accept-Ranges', 'bytes')
+        if (options.disposition) res.setHeader('Content-Disposition', contentDisposition(options.disposition, `${file.name}.pdf`))
+        const cl = pdfResponse.headers.get('content-length')
+        if (cl) res.setHeader('Content-Length', cl)
+        if (!pdfResponse.body) { res.end(); return }
+        const r = pdfResponse.body.getReader()
+        async function pumpPdf(): Promise<void> {
+          const { done, value } = await r.read()
+          if (done) { res.end(); return }
+          res.write(Buffer.from(value))
+          return pumpPdf()
+        }
+        return pumpPdf()
+      }
+    }
+    return res.status(response.status).json({ code: 'GOOGLE_FILE_STREAM_FAILED', message: text || response.statusText })
   }
 
   res.status(response.status)

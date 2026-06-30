@@ -3,11 +3,11 @@ import { X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
-export function DummyModal({ open, title, description, children, onClose, className }: { open: boolean; title: string; description: string; children: ReactNode; onClose: () => void; className?: string }) {
+export function DummyModal({ open, title, description, children, onClose, className, overlayClassName }: { open: boolean; title: string; description: string; children: ReactNode; onClose: () => void; className?: string; overlayClassName?: string }) {
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-end justify-center p-0 sm:items-center sm:p-4">
+    <div className={cn('fixed inset-0 z-[60] flex items-end justify-center p-0 sm:items-center sm:p-4', overlayClassName)}>
       <button className="absolute inset-0 bg-slate-950/45" aria-label="Close modal" onClick={onClose} />
       <div className={cn('relative max-h-[calc(100dvh-2rem)] w-full overflow-y-auto rounded-t-3xl border border-slate-200 bg-white p-5 shadow-2xl shadow-slate-950/20 sm:max-w-md sm:rounded-2xl', className)}>
         <div className="flex items-start justify-between gap-4">

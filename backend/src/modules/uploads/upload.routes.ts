@@ -142,7 +142,6 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
 
         const account = await selectAccount(req.user!.id, meta.sizeBytes, reservedBytesByAccount)
         if (!account) {
-          fileStream.resume()
           failed.push({ fileName, code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space for this upload.' })
           return
         }
@@ -153,9 +152,10 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
 
         const session = await prisma.uploadSession.create({ data: { userId: req.user!.id, targetConnectedAccountId: account.id, fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, status: 'uploading' } })
         logUpload('file upload started', { sessionId: session.id, accountId: account.id, fileName, sizeBytes: meta.sizeBytes.toString() })
-        let streamedBytes = 0n
-        fileStream.on('data', (chunk: Buffer) => {
-          streamedBytes += BigInt(chunk.length)
+        let streamErrored = false
+        fileStream.on('error', (error) => {
+          streamErrored = true
+          logUpload('file stream error', { fileName, message: error instanceof Error ? error.message : 'Unknown stream error' })
         })
 
         let providerFileId = ''
@@ -177,6 +177,10 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           const auth = await getAuthedGoogleClient(account)
           const drive = google.drive({ version: 'v3', auth })
           const appFolderId = await ensureGoogleAppFolder(account)
+          let streamedBytes = 0n
+          fileStream.on('data', (chunk: Buffer) => {
+            streamedBytes += BigInt(chunk.length)
+          })
           const uploaded = await drive.files.create({
             requestBody: { name: fileName, parents: [appFolderId] },
             media: { mimeType: meta.mimeType, body: fileStream },
@@ -185,13 +189,20 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           providerFileId = uploaded.data.id ?? ''
           uploadedName = uploaded.data.name ?? fileName
           uploadedMimeType = uploaded.data.mimeType ?? meta.mimeType
+
+          if (streamedBytes !== meta.sizeBytes) {
+            await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'Streamed byte count did not match declared size.' } })
+            failed.push({ fileName, code: 'UPLOAD_SIZE_MISMATCH', message: 'Streamed byte count did not match declared size.' })
+            return
+          }
+
           logUpload('google upload completed', { sessionId: session.id, accountId: account.id, fileName })
         }
 
-        if (streamedBytes !== meta.sizeBytes) {
+        if (streamErrored) {
           if (s3FileId) await prisma.file.update({ where: { id: s3FileId }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
-          await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'Streamed byte count did not match declared size.' } })
-          failed.push({ fileName, code: 'UPLOAD_SIZE_MISMATCH', message: 'Streamed byte count did not match declared size.' })
+          await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'File stream errored during upload.' } })
+          failed.push({ fileName, code: 'UPLOAD_STREAM_ERROR', message: 'File stream errored during upload.' })
           return
         }
 
@@ -204,9 +215,9 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
         else syncQuotaInBackground(account.id, session.id)
       } catch (error) {
-        fileStream.resume()
-        logUpload('file upload failed', { fileName, message: error instanceof Error ? error.message : 'Upload failed' })
-        failed.push({ fileName, code: 'UPLOAD_FAILED', message: error instanceof Error ? error.message : 'Upload failed' })
+        const msg = error instanceof Error ? error.message : 'Upload failed'
+        logUpload('file upload failed', { fileName, message: msg, stack: error instanceof Error ? error.stack?.split('\n').slice(0, 3).join(';') : undefined })
+        failed.push({ fileName, code: 'UPLOAD_FAILED', message: msg })
       }
     }
 

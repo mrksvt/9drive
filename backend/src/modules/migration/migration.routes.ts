@@ -14,15 +14,6 @@ import { crawlDriveFiles } from '../google/drive-scanner.js'
 export const migrationRouter = Router()
 
 migrationRouter.get('/source/callback', async (req, res, next) => {
-  const sendPopupClose = (status: string, data?: Record<string, string>) => {
-    const payload = JSON.stringify({ type: 'MIGRATION_SOURCE_CONNECTED', status, ...data })
-    res.setHeader('Content-Type', 'text/html')
-    res.send(`<!DOCTYPE html><html><body><script>
-try { if (window.opener) { window.opener.postMessage(${payload}, window.location.origin); window.close(); } } catch(e) {}
-if (!window.opener || !window.closed) setTimeout(function() { window.location.href = '${env.FRONTEND_URL}/migration?source=${status}' + ${data?.accountId ? `'&accountId=${data.accountId}'` : "''"}; }, 300);
-</script></body></html>`)
-  }
-
   try {
     const query = z.object({ code: z.string(), state: z.string() }).parse(req.query)
     const oauthState = await prisma.oauthState.findUniqueOrThrow({
@@ -30,10 +21,10 @@ if (!window.opener || !window.closed) setTimeout(function() { window.location.hr
       include: { providerConfig: true },
     })
     if (oauthState.usedAt || oauthState.expiresAt < new Date()) {
-      return sendPopupClose('error', { message: 'expired' })
+      return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=expired`)
     }
     if (oauthState.flow !== 'migration_source' || !oauthState.userId) {
-      return sendPopupClose('error', { message: 'invalid_flow' })
+      return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=invalid_flow`)
     }
 
     const client = createOAuthClient(oauthState.providerConfig)
@@ -41,7 +32,7 @@ if (!window.opener || !window.closed) setTimeout(function() { window.location.hr
     const tokenResult = await client.getToken({ code: query.code, redirect_uri: callbackUrl })
     const tokens = tokenResult.tokens
     if (!tokens.access_token) {
-      return sendPopupClose('error', { message: 'no_token' })
+      return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=no_token`)
     }
     client.setCredentials(tokens)
     const oauth2 = google.oauth2({ version: 'v2', auth: client })
@@ -49,7 +40,7 @@ if (!window.opener || !window.closed) setTimeout(function() { window.location.hr
     const providerAccountId = profile.data.id
     const email = profile.data.email
     if (!providerAccountId || !email) {
-      return sendPopupClose('error', { message: 'no_profile' })
+      return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=no_profile`)
     }
 
     const existingAccount = await prisma.connectedAccount.findUnique({
@@ -57,7 +48,7 @@ if (!window.opener || !window.closed) setTimeout(function() { window.location.hr
     })
     const refreshTokenEncrypted = tokens.refresh_token ? encryptText(tokens.refresh_token) : existingAccount?.refreshTokenEncrypted
     if (!refreshTokenEncrypted) {
-      return sendPopupClose('error', { message: 'no_refresh' })
+      return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=no_refresh`)
     }
 
     const account = await prisma.connectedAccount.upsert({
@@ -89,9 +80,9 @@ if (!window.opener || !window.closed) setTimeout(function() { window.location.hr
       },
     })
     await prisma.oauthState.update({ where: { id: oauthState.id }, data: { usedAt: new Date() } })
-    return sendPopupClose('connected', { accountId: account.id })
+    return res.redirect(`${env.FRONTEND_URL}/migration?source=connected&accountId=${account.id}`)
   } catch (error) {
-    return sendPopupClose('error', { message: 'unknown' })
+    return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=unknown`)
   }
 })
 

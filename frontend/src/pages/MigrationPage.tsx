@@ -116,7 +116,17 @@ export function MigrationPage() {
 
   useEffect(() => {
     const sp = searchParams.get('source')
-    if (sp === 'connected') { setMessage('Google Drive source connected.'); loadSources(); setSearchParams({}, { replace: true }); setSourceModalOpen(true) }
+    if (sp === 'connected') {
+      if (window.opener) {
+        window.opener.postMessage({ type: 'MIGRATION_SOURCE_CONNECTED', status: 'connected', accountId: searchParams.get('accountId') }, window.location.origin)
+        window.close()
+        return
+      }
+      setMessage('Google Drive source connected.')
+      loadSources()
+      setSearchParams({}, { replace: true })
+      setSourceModalOpen(true)
+    }
     else if (sp === 'error') { setMessage(`Error: ${searchParams.get('message') ?? 'Connection failed'}`); setSearchParams({}, { replace: true }) }
   }, [searchParams, setSearchParams, loadSources])
 

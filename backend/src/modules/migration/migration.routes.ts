@@ -28,7 +28,7 @@ migrationRouter.get('/source/callback', async (req, res, next) => {
     }
 
     const client = createOAuthClient(oauthState.providerConfig)
-    const callbackUrl = `${env.APP_PORT ? `http://localhost:${env.APP_PORT}` : new URL(oauthState.providerConfig.redirectUri).origin}/migrations/source/callback`
+    const callbackUrl = `${env.FRONTEND_URL}/api/migrations/source/callback`
     const tokenResult = await client.getToken({ code: query.code, redirect_uri: callbackUrl })
     const tokens = tokenResult.tokens
     if (!tokens.access_token) {

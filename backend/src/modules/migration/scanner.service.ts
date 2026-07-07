@@ -1,7 +1,8 @@
 import { google } from 'googleapis'
 import { z } from 'zod'
+import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
-import { getAuthedGoogleClient } from '../google/google.service.js'
+import { getAuthedGoogleClient, createOAuthClient } from '../google/google.service.js'
 import { crawlDriveFiles, type CrawlCursor } from '../google/drive-scanner.js'
 import { emit } from './migration.service.js'
 
@@ -434,11 +435,8 @@ export class ScannerService {
     })
 
     const client = createOAuthClient(config)
-    const callbackUrl = `${
-      env.APP_PORT
-        ? `http://localhost:${env.APP_PORT}`
-        : new URL(config.redirectUri).origin
-    }/migrations/source/callback`
+    const backendOrigin = env.FRONTEND_URL
+    const callbackUrl = `${backendOrigin}/api/migrations/source/callback`
 
     return client.generateAuthUrl({
       access_type: 'offline',
@@ -463,7 +461,6 @@ export class ScannerService {
 
 export const scannerService = new ScannerService()
 
-// Helper functions
 function randomToken(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)))
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -471,16 +468,5 @@ function randomToken(): string {
 }
 
 function hashToken(token: string): string {
-  // Simple hash for state tokens - in production use crypto.createHash
   return token
-}
-
-function createOAuthClient(config: any) {
-  // Re-export from google service
-  const { createOAuthClient } = require('../google/google.service.js')
-  return createOAuthClient(config)
-}
-
-const env = {
-  APP_PORT: process.env.APP_PORT
 }

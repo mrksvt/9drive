@@ -121,6 +121,19 @@ export function MigrationPage() {
   }, [searchParams, setSearchParams, loadSources])
 
   useEffect(() => {
+    function handleMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin) return
+      if (event.data?.type === 'MIGRATION_SOURCE_CONNECTED' && event.data?.status === 'connected') {
+        setMessage('Google Drive source connected.')
+        loadSources()
+        setSourceModalOpen(true)
+      }
+    }
+    window.addEventListener('message', handleMessage)
+    return () => window.removeEventListener('message', handleMessage)
+  }, [loadSources])
+
+  useEffect(() => {
     if (!sourceAccountId) { setExistingScan(null); return }
     checkScanStatus(sourceAccountId).then((status) => {
       setExistingScan(status)

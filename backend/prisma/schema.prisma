@@ -8,28 +8,29 @@ datasource db {
 }
 
 model User {
-  id             String             @id @default(uuid()) @db.Char(36)
-  name           String             @db.VarChar(191)
-  email          String             @unique @db.VarChar(191)
-  passwordHash   String             @map("password_hash") @db.VarChar(255)
-  status         String             @default("active") @db.VarChar(32)
-  createdAt      DateTime           @default(now()) @map("created_at")
-  updatedAt      DateTime           @updatedAt @map("updated_at")
-  sessions       UserSession[]
-  authHandoffs   AuthHandoff[]
-  providerConfigs ProviderConfig[]
-  oauthStates    OauthState[]
-  connectedAccounts ConnectedAccount[]
-  s3StorageConfigs S3StorageConfig[]
-  files          File[]
-  fileShares     FileShare[]
-  filePreviewTokens FilePreviewToken[]
-  folders        Folder[]
-  uploadSessions UploadSession[]
-  auditLogs      AuditLog[]
-  workspaceInvitesSent WorkspaceInvite[] @relation("WorkspaceInvitesSent")
-  uploadRoutingPolicy UploadRoutingPolicy?
-  apiKeys       ApiKey[]
+  id                   String               @id @default(uuid()) @db.Char(36)
+  name                 String               @db.VarChar(191)
+  email                String               @unique @db.VarChar(191)
+  passwordHash         String               @map("password_hash") @db.VarChar(255)
+  status               String               @default("active") @db.VarChar(32)
+  createdAt            DateTime             @default(now()) @map("created_at")
+  updatedAt            DateTime             @updatedAt @map("updated_at")
+  sessions             UserSession[]
+  authHandoffs         AuthHandoff[]
+  providerConfigs      ProviderConfig[]
+  oauthStates          OauthState[]
+  connectedAccounts    ConnectedAccount[]
+  s3StorageConfigs     S3StorageConfig[]
+  files                File[]
+  fileShares           FileShare[]
+  filePreviewTokens    FilePreviewToken[]
+  folders              Folder[]
+  uploadSessions       UploadSession[]
+  auditLogs            AuditLog[]
+  workspaceInvitesSent WorkspaceInvite[]    @relation("WorkspaceInvitesSent")
+  uploadRoutingPolicy  UploadRoutingPolicy?
+  apiKeys              ApiKey[]
+  migrationSessions    MigrationSession[]
 
   @@map("users")
 }
@@ -134,29 +135,31 @@ model OauthState {
 }
 
 model ConnectedAccount {
-  id                    String          @id @default(uuid()) @db.Char(36)
-  userId                String          @map("user_id") @db.Char(36)
-  providerConfigId      String?         @map("provider_config_id") @db.Char(36)
-  provider              String          @db.VarChar(32)
-  providerAccountId     String          @map("provider_account_id") @db.VarChar(191)
-  email                 String          @db.VarChar(191)
-  displayName           String?         @map("display_name") @db.VarChar(191)
-  avatarUrl             String?         @map("avatar_url") @db.Text
-  accessTokenEncrypted  String?         @map("access_token_encrypted") @db.Text
-  refreshTokenEncrypted String?         @map("refresh_token_encrypted") @db.Text
-  tokenExpiresAt        DateTime?       @map("token_expires_at")
+  id                    String             @id @default(uuid()) @db.Char(36)
+  userId                String             @map("user_id") @db.Char(36)
+  providerConfigId      String?            @map("provider_config_id") @db.Char(36)
+  provider              String             @db.VarChar(32)
+  providerAccountId     String             @map("provider_account_id") @db.VarChar(191)
+  email                 String             @db.VarChar(191)
+  displayName           String?            @map("display_name") @db.VarChar(191)
+  avatarUrl             String?            @map("avatar_url") @db.Text
+  accessTokenEncrypted  String?            @map("access_token_encrypted") @db.Text
+  refreshTokenEncrypted String?            @map("refresh_token_encrypted") @db.Text
+  tokenExpiresAt        DateTime?          @map("token_expires_at")
   scopes                Json
-  status                String          @default("connected") @db.VarChar(32)
-  lastError             String?         @map("last_error") @db.Text
-  createdAt             DateTime        @default(now()) @map("created_at")
-  updatedAt             DateTime        @updatedAt @map("updated_at")
-  user                  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  providerConfig        ProviderConfig? @relation(fields: [providerConfigId], references: [id], onDelete: Cascade)
+  status                String             @default("connected") @db.VarChar(32)
+  lastError             String?            @map("last_error") @db.Text
+  createdAt             DateTime           @default(now()) @map("created_at")
+  updatedAt             DateTime           @updatedAt @map("updated_at")
+  user                  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providerConfig        ProviderConfig?    @relation(fields: [providerConfigId], references: [id], onDelete: Cascade)
   storageAccount        StorageAccount?
   files                 File[]
   folders               Folder[]
   uploadSessions        UploadSession[]
   s3StorageConfig       S3StorageConfig?
+  migrationSource       MigrationSession[] @relation("MigrationSource")
+  migrationTarget       MigrationSession[] @relation("MigrationTarget")
 
   @@unique([userId, provider, providerAccountId])
   @@index([userId])
@@ -204,23 +207,23 @@ model StorageAccount {
 }
 
 model File {
-  id                 String           @id @default(uuid()) @db.Char(36)
-  userId             String           @map("user_id") @db.Char(36)
-  connectedAccountId String           @map("connected_account_id") @db.Char(36)
-  folderId           String?          @map("folder_id") @db.Char(36)
-  provider           String           @db.VarChar(32)
-  providerFileId     String           @map("provider_file_id") @db.VarChar(191)
-  name               String           @db.VarChar(255)
-  mimeType           String           @map("mime_type") @db.VarChar(191)
-  sizeBytes          BigInt           @map("size_bytes")
-  checksum           String?          @db.VarChar(191)
-  status             String           @default("active") @db.VarChar(32)
-  createdAt          DateTime         @default(now()) @map("created_at")
-  updatedAt          DateTime         @updatedAt @map("updated_at")
-  deletedAt          DateTime?        @map("deleted_at")
-  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  connectedAccount   ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
-  folder             Folder?          @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  id                 String             @id @default(uuid()) @db.Char(36)
+  userId             String             @map("user_id") @db.Char(36)
+  connectedAccountId String             @map("connected_account_id") @db.Char(36)
+  folderId           String?            @map("folder_id") @db.Char(36)
+  provider           String             @db.VarChar(32)
+  providerFileId     String             @map("provider_file_id") @db.VarChar(191)
+  name               String             @db.VarChar(255)
+  mimeType           String             @map("mime_type") @db.VarChar(191)
+  sizeBytes          BigInt             @map("size_bytes")
+  checksum           String?            @db.VarChar(191)
+  status             String             @default("active") @db.VarChar(32)
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+  deletedAt          DateTime?          @map("deleted_at")
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connectedAccount   ConnectedAccount   @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+  folder             Folder?            @relation(fields: [folderId], references: [id], onDelete: SetNull)
   shares             FileShare[]
   previewTokens      FilePreviewToken[]
 
@@ -345,4 +348,98 @@ model WorkspaceInvite {
   @@index([inviteeEmail])
   @@index([targetType, targetId])
   @@map("workspace_invites")
+}
+
+model MigrationSession {
+  id              String           @id @default(uuid()) @db.Char(36)
+  userId          String           @map("user_id") @db.Char(36)
+  sourceAccountId String           @map("source_account_id") @db.Char(36)
+  targetAccountId String           @map("target_account_id") @db.Char(36)
+  status          String           @default("pending") @db.VarChar(32)
+  totalFiles      Int              @default(0) @map("total_files")
+  totalFolders    Int              @default(0) @map("total_folders")
+  completedFiles  Int              @default(0) @map("completed_files")
+  failedFiles     Int              @default(0) @map("failed_files")
+  skippedFiles    Int              @default(0) @map("skipped_files")
+  totalBytes      BigInt           @default(0) @map("total_bytes")
+  migratedBytes   BigInt           @default(0) @map("migrated_bytes")
+  errorMessage    String?          @map("error_message") @db.Text
+  cursor          Json?
+  startedAt       DateTime?        @map("started_at")
+  completedAt     DateTime?        @map("completed_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceAccount   ConnectedAccount @relation("MigrationSource", fields: [sourceAccountId], references: [id], onDelete: Cascade)
+  targetAccount   ConnectedAccount @relation("MigrationTarget", fields: [targetAccountId], references: [id], onDelete: Cascade)
+  items           MigrationItem[]
+  migrationJobs   MigrationJob[]
+
+  @@index([userId])
+  @@index([userId, status])
+  @@index([userId, createdAt])
+  @@map("migration_sessions")
+}
+
+model MigrationItem {
+  id             String           @id @default(uuid()) @db.Char(36)
+  migrationId    String           @map("migration_id") @db.Char(36)
+  sourceFileId   String           @map("source_file_id") @db.VarChar(191)
+  sourceParentId String?          @map("source_parent_id") @db.VarChar(191)
+  name           String           @db.VarChar(255)
+  mimeType       String           @map("mime_type") @db.VarChar(191)
+  sizeBytes      BigInt           @map("size_bytes")
+  isFolder       Boolean          @default(false) @map("is_folder")
+  status         String           @default("pending") @db.VarChar(32)
+  targetFileId   String?          @map("target_file_id") @db.VarChar(191)
+  targetFolderId String?          @map("target_folder_id") @db.Char(36)
+  errorMessage   String?          @map("error_message") @db.Text
+  retryCount     Int              @default(0) @map("retry_count")
+  modifiedTime   DateTime?        @map("modified_time")
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+  migration      MigrationSession @relation(fields: [migrationId], references: [id], onDelete: Cascade)
+
+  @@index([migrationId])
+  @@index([migrationId, status])
+  @@map("migration_items")
+}
+
+model MigrationJob {
+  id           String           @id @default(uuid()) @db.Char(36)
+  migrationId  String           @map("migration_id") @db.Char(36)
+  type         String           @db.VarChar(32)
+  status       String           @default("pending") @db.VarChar(32)
+  payload      Json?
+  retryCount   Int              @default(0) @map("retry_count")
+  maxRetries   Int              @default(3) @map("max_retries")
+  errorMessage String?          @map("error_message") @db.Text
+  startedAt    DateTime?        @map("started_at")
+  completedAt  DateTime?        @map("completed_at")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+  migration    MigrationSession @relation(fields: [migrationId], references: [id], onDelete: Cascade)
+
+  @@index([migrationId])
+  @@index([status])
+  @@index([migrationId, status])
+  @@index([createdAt])
+  @@map("migration_jobs")
+}
+
+model TransferLog {
+  id               String   @id @default(uuid()) @db.Char(36)
+  migrationId      String   @map("migration_id") @db.Char(36)
+  itemId           String   @map("item_id") @db.Char(36)
+  action           String   @db.VarChar(32)
+  bytesTransferred BigInt   @default(0) @map("bytes_transferred")
+  totalBytes       BigInt   @default(0) @map("total_bytes")
+  errorMessage     String?  @map("error_message") @db.Text
+  metadata         Json?
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@index([migrationId])
+  @@index([itemId])
+  @@index([migrationId, itemId])
+  @@map("transfer_logs")
 }

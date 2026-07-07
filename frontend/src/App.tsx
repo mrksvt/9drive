@@ -14,6 +14,7 @@ import { SharedPage } from '@/pages/SharedPage'
 import { StarredPage } from '@/pages/StarredPage'
 import { PublicFilePage } from '@/pages/PublicFilePage'
 import { ApiManagementPage } from '@/pages/ApiManagementPage'
+import { MigrationPage } from '@/pages/MigrationPage'
 
 function App() {
   return (
@@ -35,6 +36,7 @@ function App() {
           <Route path="archived" element={<ArchivedPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="api" element={<ApiManagementPage />} />
+          <Route path="migration" element={<MigrationPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/all-files" replace />} />

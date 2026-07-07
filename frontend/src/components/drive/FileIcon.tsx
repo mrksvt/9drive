@@ -1,4 +1,4 @@
-import { FileArchive, FileImage, FilePlay, Folder } from 'lucide-react'
+import { File, FileArchive, FileImage, FilePlay } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { FileItem } from '@/data/drive-data'
 
@@ -7,5 +7,5 @@ export function FileIcon({ kind, className }: { kind: FileItem['kind']; classNam
   if (kind === 'image') return <FileImage className={cn(base, 'bg-yellow-400', className)} />
   if (kind === 'video') return <FilePlay className={cn(base, 'bg-orange-500', className)} />
   if (kind === 'pdf') return <FileArchive className={cn(base, 'bg-cyan-400', className)} />
-  return <Folder className={cn(base, 'bg-lime-500', className)} />
+  return <File className={cn(base, 'bg-slate-400', className)} />
 }

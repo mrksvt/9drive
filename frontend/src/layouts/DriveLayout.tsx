@@ -1,6 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import {
+  ArrowRightLeft,
   Bell,
   Braces,
   FileArchive,
@@ -26,9 +27,10 @@ import { cn } from '@/lib/utils'
 
 const menu = [
   { label: 'All Files', icon: FileArchive, href: '/all-files' },
-  { label: 'Quota Tracker', icon: Gauge, href: '/quota' },
-  { label: 'Shared With Me', icon: Share2, href: '/shared' },
   { label: 'Starred', icon: Star, href: '/starred', disabled: true },
+  { label: 'Shared With Me', icon: Share2, href: '/shared' },
+  { label: 'Migration', icon: ArrowRightLeft, href: '/migration' },
+  { label: 'Quota Tracker', icon: Gauge, href: '/quota' },
 ]
 
 type StorageSummary = {

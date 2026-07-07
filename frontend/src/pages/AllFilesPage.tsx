@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type MouseEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Archive, Box, CheckCircle, ChevronDown, ClipboardPaste, Download, FolderInput, FolderPlus, LayoutGrid, List, MoreVertical, RefreshCw, RotateCcw, Share2, Star, Trash2, Upload, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Archive, CheckCircle, ClipboardPaste, FolderInput, FolderPlus, LayoutGrid, List, MoreVertical, RefreshCw, Star, Trash2, Upload, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { DummyModal } from '@/components/drive/DummyModal'
@@ -8,16 +8,18 @@ import { EmptyAreaContextMenu } from '@/components/drive/EmptyAreaContextMenu'
 import { FileContextMenu } from '@/components/drive/FileContextMenu'
 import { FileDetailsDrawer } from '@/components/drive/FileDetailsDrawer'
 import { FileGrid } from '@/components/drive/FileGrid'
+import { FilePreview } from '@/components/drive/FilePreview'
 import { FileTable } from '@/components/drive/FileTable'
 import { FolderContextMenu } from '@/components/drive/FolderContextMenu'
 import { FolderGrid } from '@/components/drive/FolderGrid'
 import { defaultFolderColor, defaultFolderIconUrl, FolderVisual, folderColorOptions, folderIconOptions, normalizeFolderColor } from '@/components/drive/FolderVisual'
 import { PageHeader } from '@/components/drive/PageHeader'
+import { NetworkWarning, useNetworkGuard } from '@/components/drive/NetworkWarning'
+import { UploadProgressPanel } from '@/components/drive/UploadProgressPanel'
 import { Input } from '@/components/ui/input'
 import { API_URL, apiFetch, formatBytes, formatDate } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
-import { createPlyr, ensurePlyr } from '@/lib/plyr'
-import { getPreviewKind, isGoogleNativeDoc, isOfficeDoc, officeViewerUrl } from '@/lib/preview'
+import { isGoogleNativeDoc, isOfficeDoc } from '@/lib/preview'
 import type { FileItem, FolderItem } from '@/data/drive-data'
 
 type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
@@ -136,7 +138,6 @@ export function AllFilesPage() {
   const [inviteTargetId, setInviteTargetId] = useState('')
   const [inviteMessage, setInviteMessage] = useState('')
   const [inviting, setInviting] = useState(false)
-  const previewVideoRef = useRef<HTMLVideoElement | null>(null)
   const [previewZoom, setPreviewZoom] = useState(1)
   const [previewPanX, setPreviewPanX] = useState(0)
   const [previewPanY, setPreviewPanY] = useState(0)
@@ -147,6 +148,8 @@ export function AllFilesPage() {
   const previewIsDraggingRef = useRef(false)
   const previewDragRef = useRef({ startX: 0, startY: 0 })
   const previewContainerRef = useRef<HTMLDivElement | null>(null)
+  const { status: networkStatus, loading: networkLoading, isBlocked: networkBlocked } = useNetworkGuard()
+  const isBlocked = networkBlocked ?? false
 
     const folderFiles = files.filter(f => f.mimeType === folderMime)
   const nonFolderFiles = files.filter(f => f.mimeType !== folderMime)
@@ -158,7 +161,7 @@ export function AllFilesPage() {
       return
     }
     setActiveFile(file)
-    viewFile()
+    viewFileFor(file)
   }
 
 async function loadFiles() {
@@ -209,22 +212,6 @@ async function loadFiles() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [activeFolderForMenu, cutFolder, activeFolderId])
-
-  useEffect(() => {
-    if (!previewOpen || !activeFile?.mimeType?.startsWith('video/') || !previewVideoRef.current) return undefined
-    let disposed = false
-    let player: { destroy: () => void } | null = null
-
-    ensurePlyr().then(() => {
-      if (disposed || !previewVideoRef.current) return
-      player = createPlyr(previewVideoRef.current)
-    }).catch(() => undefined)
-
-    return () => {
-      disposed = true
-      player?.destroy()
-    }
-  }, [previewOpen, activeFile?.mimeType, previewUrl])
 
   async function createFolder(event: FormEvent) {
     event.preventDefault()
@@ -391,8 +378,8 @@ async function loadFiles() {
     setSearchParams(searchQuery ? { q: searchQuery } : {})
   }
 
-  async function viewFile() {
-    if (!activeFile?.id) return
+  async function viewFileFor(file: FileItem) {
+    if (!file.id) return
     setPreviewUrl('')
     setPreviewError('')
     setPreviewLoading(true)
@@ -404,7 +391,7 @@ async function loadFiles() {
     setPreviewRotateY(0)
     setContextMenu({ x: 0, y: 0, file: null })
     try {
-      const data = await apiFetch<{ path?: string; url: string }>(`/files/${activeFile.id}/preview-token`, { method: 'POST' })
+      const data = await apiFetch<{ path?: string; url: string }>(`/files/${file.id}/preview-token`, { method: 'POST' })
       const previewPath = data.path ?? new URL(data.url).pathname
       setPreviewUrl(`${API_URL}${previewPath}`)
     } catch (error) {
@@ -412,6 +399,11 @@ async function loadFiles() {
     } finally {
       setPreviewLoading(false)
     }
+  }
+
+  async function viewFile() {
+    if (!activeFile?.id) return
+    viewFileFor(activeFile)
   }
 
   async function downloadFile() {
@@ -569,48 +561,6 @@ async function loadFiles() {
     setPreview3DEnabled(false)
   }
 
-  function resetPreviewTransform() {
-    setPreviewZoom(1)
-    setPreviewPanX(0)
-    setPreviewPanY(0)
-    setPreviewRotateX(0)
-    setPreviewRotateY(0)
-    setPreview3DEnabled(false)
-  }
-
-  function handlePreviewMouseDown(event: React.MouseEvent<HTMLDivElement>) {
-    if (previewZoom <= 1 || event.button !== 0) return
-    previewIsDraggingRef.current = true
-    setPreviewIsDragging(true)
-    previewDragRef.current = { startX: event.clientX - previewPanX, startY: event.clientY - previewPanY }
-  }
-
-  function handlePreviewMouseMove(event: React.MouseEvent<HTMLDivElement>) {
-    if (previewIsDraggingRef.current) {
-      setPreviewPanX(event.clientX - previewDragRef.current.startX)
-      setPreviewPanY(event.clientY - previewDragRef.current.startY)
-    } else if (preview3DEnabled && previewContainerRef.current) {
-      const rect = previewContainerRef.current.getBoundingClientRect()
-      const centerX = rect.left + rect.width / 2
-      const centerY = rect.top + rect.height / 2
-      const maxAngle = 15
-      setPreviewRotateX(((event.clientY - centerY) / (rect.height / 2)) * -maxAngle)
-      setPreviewRotateY(((event.clientX - centerX) / (rect.width / 2)) * maxAngle)
-    }
-  }
-
-  function handlePreviewMouseUp() {
-    previewIsDraggingRef.current = false
-    setPreviewIsDragging(false)
-  }
-
-  function handlePreviewMouseLeave() {
-    previewIsDraggingRef.current = false
-    setPreviewIsDragging(false)
-    setPreviewRotateX(0)
-    setPreviewRotateY(0)
-  }
-
   const recentFolders = folders.slice(0, 4)
   const moreFolders = folders.slice(4)
   const activeFolder = allFolders.find((folder) => folder.id === activeFolderId)
@@ -628,28 +578,13 @@ async function loadFiles() {
     return path
   })()
   const allVisibleSelected = files.length > 0 && files.every((file) => file.id && selectedFileIds.has(file.id))
-  const activePreviewKind = getPreviewKind(activeFile?.mimeType)
-  const uploadPanelTitle = uploadProgress.status === 'done' ? 'Upload complete' : uploadProgress.status === 'partial' ? 'Upload completed with errors' : uploadProgress.status === 'error' ? 'Upload failed' : uploadProgress.percent >= 99 ? 'Processing on server' : 'Uploading files'
-
-  useEffect(() => {
-    const container = previewContainerRef.current
-    if (!container || activePreviewKind !== 'image') return
-    const onWheel = (event: WheelEvent) => {
-      event.preventDefault()
-      setPreviewZoom(prev => {
-        const delta = event.deltaY > 0 ? -0.1 : 0.1
-        return Math.max(0.5, Math.min(5, +(prev + delta).toFixed(2)))
-      })
-    }
-    container.addEventListener('wheel', onWheel, { passive: false })
-    return () => container.removeEventListener('wheel', onWheel)
-  }, [activePreviewKind, previewUrl])
 
   return (
     <>
       <div onContextMenu={openEmptyContextMenu} className="min-h-[620px] w-full min-w-0">
-      <PageHeader title={activeFolder ? <span className="block min-w-0 truncate"><button className="text-blue-600 hover:underline" onClick={closeFolder}>All Files</button>{folderBreadcrumbs.map((folder, index) => <span key={folder.id}><span className="text-slate-400"> / </span>{index === folderBreadcrumbs.length - 1 ? <span>{folder.name}</span> : <button className="text-blue-600 hover:underline" onClick={() => folder.id && openFolderById(folder.id)}>{folder.name}</button>}</span>)}</span> : 'All Files'} actions={<><Button className="w-full" onClick={() => setUploadOpen(true)}><Upload className="h-4 w-4" />Upload</Button><Button className="w-full" variant="outline" onClick={() => setFolderOpen(true)}><FolderPlus className="h-4 w-4" />New Folder</Button><Button className="w-full" variant="outline" disabled={syncingDrive} onClick={syncGoogleDrive}><RefreshCw className={syncingDrive ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingDrive ? 'Syncing...' : 'Sync Drive'}</Button></>} />
+      <PageHeader title={activeFolder ? <span className="block min-w-0 truncate"><button className="text-blue-600 hover:underline" onClick={closeFolder}>All Files</button>{folderBreadcrumbs.map((folder, index) => <span key={folder.id}><span className="text-slate-400"> / </span>{index === folderBreadcrumbs.length - 1 ? <span>{folder.name}</span> : <button className="text-blue-600 hover:underline" onClick={() => folder.id && openFolderById(folder.id)}>{folder.name}</button>}</span>)}</span> : 'All Files'} actions={<><Button className="w-full" onClick={() => setUploadOpen(true)} disabled={isBlocked}><Upload className="h-4 w-4" />Upload</Button><Button className="w-full" variant="outline" onClick={() => setFolderOpen(true)}><FolderPlus className="h-4 w-4" />New Folder</Button><Button className="w-full" variant="outline" disabled={syncingDrive} onClick={syncGoogleDrive}><RefreshCw className={syncingDrive ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingDrive ? 'Syncing...' : 'Sync Drive'}</Button></>} />
       {message ? <p className="mt-5 rounded-xl bg-blue-50 p-3 text-sm text-blue-700">{message}</p> : null}
+      <NetworkWarning status={networkStatus} loading={networkLoading} />
       {!activeFolder && (recentFolders.length > 0 ? <FolderGrid items={recentFolders} mobileTwoColumns onFolderMenu={openFolderMenu} onFolderOpen={openFolder} /> : <p className="mt-8 rounded-xl bg-slate-50 p-5 text-sm text-slate-500">No folders yet. Click New Folder to organize uploads.</p>)}
       {!activeFolder && moreFolders.length > 0 ? <Card className="mt-5 p-4 sm:p-5"><h2 className="font-extrabold">More Folders</h2><div className="mt-4 grid gap-3 sm:grid-cols-2">{moreFolders.map((folder) => <div key={folder.id} onClick={() => openFolder(folder)} onContextMenu={(event) => openFolderMenu(event, folder)} className="flex cursor-pointer items-center justify-between gap-3 rounded-xl bg-slate-50 p-3 hover:bg-slate-100"><div className="flex min-w-0 items-center gap-3"><FolderVisual folder={folder} className="h-6 w-6 shrink-0" /><div className="min-w-0"><p className="truncate font-semibold">{folder.name}</p><p className="truncate text-xs text-slate-500">{folder.updated}</p></div></div><button className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-slate-500 hover:bg-white sm:h-8 sm:w-8 sm:rounded-lg" onClick={(event) => { event.stopPropagation(); openFolderMenu(event, folder) }} aria-label={`Open ${folder.name} menu`}><MoreVertical className="h-5 w-5" /></button></div>)}</div></Card> : null}
       {activeFolder && folders.length > 0 ? <Card className="mt-5 p-4 sm:p-5"><h2 className="font-extrabold">Folders</h2><div className="mt-4 grid gap-3 sm:grid-cols-2">{folders.map((folder) => <div key={folder.id} onClick={() => openFolder(folder)} onContextMenu={(event) => openFolderMenu(event, folder)} className="flex cursor-pointer items-center justify-between gap-3 rounded-xl bg-slate-50 p-3 hover:bg-slate-100"><div className="flex min-w-0 items-center gap-3"><FolderVisual folder={folder} className="h-6 w-6 shrink-0" /><div className="min-w-0"><p className="truncate font-semibold">{folder.name}</p><p className="truncate text-xs text-slate-500">{folder.updated}</p></div></div><button className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-slate-500 hover:bg-white sm:h-8 sm:w-8 sm:rounded-lg" onClick={(event) => { event.stopPropagation(); openFolderMenu(event, folder) }} aria-label={`Open ${folder.name} menu`}><MoreVertical className="h-5 w-5" /></button></div>)}</div></Card> : null}
@@ -728,88 +663,35 @@ async function loadFiles() {
           <div className="flex justify-end gap-3 pt-2"><Button type="button" variant="outline" onClick={() => setInviteOpen(false)}>Cancel</Button><Button disabled={inviting}>{inviting ? 'Sending...' : 'Send Invite'}</Button></div>
         </form>
       </DummyModal>
-      <DummyModal open={previewOpen} title="File Preview" description={activeFile?.name ?? ''} onClose={closePreview} className="flex h-[calc(100dvh-2rem)] w-full flex-col overflow-hidden sm:max-w-[calc(100vw-2rem)]">
-        <div ref={previewContainerRef} className="flex min-h-0 flex-1 w-full items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-50" onMouseDown={handlePreviewMouseDown} onMouseMove={handlePreviewMouseMove} onMouseUp={handlePreviewMouseUp} onMouseLeave={handlePreviewMouseLeave}>
-          {previewLoading ? <div className="p-6 text-center text-sm font-semibold text-slate-500">Loading preview...</div> : null}
-          {previewError ? <div className="p-6 text-center text-sm text-red-600">{previewError}</div> : null}
-          {!previewLoading && !previewError && activePreviewKind === 'image' && previewUrl ? (
-            <div className="relative w-full h-full flex items-center justify-center overflow-hidden">
-              <div
-                className={`inline-block ${previewZoom > 1 ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'}`}
-                style={{
-                  transform: previewZoom <= 1
-                    ? `scale(${previewZoom}) rotateX(${previewRotateX}deg) rotateY(${previewRotateY}deg)`
-                    : `scale(${previewZoom}) translate(${previewPanX / previewZoom}px, ${previewPanY / previewZoom}px) rotateX(${previewRotateX}deg) rotateY(${previewRotateY}deg)`,
-                  transformStyle: 'preserve-3d',
-                  backfaceVisibility: 'hidden',
-                  transition: previewIsDragging ? 'none' : 'transform 0.15s ease',
-                }}
-              >
-                <img
-                  src={previewUrl}
-                  alt={activeFile?.name ?? 'File preview'}
-                  className="max-h-[calc(100dvh-10rem)] max-w-full object-contain"
-                  onError={() => setPreviewError('Failed to load preview.')}
-                />
-              </div>
-              <div className="absolute inset-4 pointer-events-none flex flex-col items-end justify-between">
-                <div className="flex gap-2 pointer-events-auto">
-                  <Button variant="outline" size="sm" onClick={() => downloadFile()} title="Download">
-                    <Download className="h-4 w-4" />
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={() => shareFile()} title="Share">
-                    <Share2 className="h-4 w-4" />
-                  </Button>
-                </div>
-                <div className="flex flex-col gap-2 pointer-events-auto bg-white rounded-lg border border-slate-200 p-2 shadow-lg">
-                  <Button variant="outline" size="sm" onClick={() => setPreviewZoom(prev => Math.max(0.5, prev - 0.1))} title="Zoom out">
-                    <ZoomOut className="h-4 w-4" />
-                  </Button>
-                  <span className="text-xs font-semibold text-slate-600 w-12 text-center">{(previewZoom * 100).toFixed(0)}%</span>
-                  <Button variant="outline" size="sm" onClick={() => setPreviewZoom(prev => Math.min(5, prev + 0.1))} title="Zoom in">
-                    <ZoomIn className="h-4 w-4" />
-                  </Button>
-                  <Button variant={preview3DEnabled ? 'default' : 'outline'} size="sm" onClick={() => setPreview3DEnabled(prev => !prev)} title="3D">
-                    <Box className="h-4 w-4" />
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={resetPreviewTransform} title="Reset">
-                    <RotateCcw className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-            </div>
-          ) : null}
-          {!previewLoading && !previewError && activePreviewKind === 'video' && previewUrl ? <div className="shared-video-shell"><video ref={previewVideoRef} controls playsInline preload="metadata" onError={() => setPreviewError('Failed to load preview.')}><source src={previewUrl} type={activeFile?.mimeType} /></video></div> : null}
-          {!previewLoading && !previewError && activePreviewKind === 'document' && previewUrl ? <iframe src={previewUrl} title={activeFile?.name ?? 'File preview'} className="h-full w-full border-0 bg-white" /> : null}
-          {!previewLoading && !previewError && activePreviewKind === 'office' && previewUrl ? <iframe src={officeViewerUrl(previewUrl)} title={activeFile?.name ?? 'File preview'} className="h-full w-full border-0 bg-white" /> : null}
-          {!previewLoading && !previewError && activePreviewKind === 'google-native' && activeFile ? <div className="grid gap-4 p-6 text-center"><p className="text-sm text-slate-500">This is a Google Docs file. Open it in Google's editor.</p><Button onClick={() => { closePreview(); openInGoogleEditor(activeFile); }}>Open in Google</Button></div> : null}
-          {!previewLoading && !previewError && !activePreviewKind ? <div className="p-6 text-center text-sm text-slate-500">Preview not available for this file type. Use Download instead.</div> : null}
-        </div>
-      </DummyModal>
-       {uploadProgress.open ? (
-        <div className="fixed inset-x-3 bottom-3 z-[70] max-h-[70dvh] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl shadow-slate-900/20 sm:inset-x-auto sm:bottom-5 sm:right-5 sm:w-[min(420px,calc(100vw-2.5rem))]">
-          <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-            <div className="flex items-center gap-2 font-extrabold">
-              {uploadProgress.status === 'done' ? <CheckCircle className="h-5 w-5 text-emerald-500" /> : uploadProgress.status === 'partial' || uploadProgress.status === 'error' ? <X className="h-5 w-5 text-red-500" /> : <Upload className="h-5 w-5 text-blue-600" />}
-              {uploadPanelTitle}
-            </div>
-            <div className="flex items-center gap-1">
-              <Button variant="ghost" size="icon" className="h-8 w-8"><ChevronDown className="h-4 w-4" /></Button>
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setUploadProgress((current) => ({ ...current, open: false }))}><X className="h-4 w-4" /></Button>
-            </div>
-          </div>
-          <div className="p-4">
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <p className="truncate font-semibold">{uploadProgress.fileName}</p>
-              <span className="text-slate-500">{uploadProgress.percent}%</span>
-            </div>
-            <div className="mt-3 h-2 rounded-full bg-slate-100">
-              <div className={uploadProgress.status === 'error' || uploadProgress.status === 'partial' ? 'h-full rounded-full bg-red-500' : uploadProgress.status === 'done' ? 'h-full rounded-full bg-emerald-500' : 'h-full rounded-full bg-blue-600'} style={{ width: `${uploadProgress.percent}%` }} />
-            </div>
-            {uploadProgress.files.length > 0 ? <div className="mt-4 grid max-h-64 gap-3 overflow-y-auto pr-1">{uploadProgress.files.map((file, index) => <div key={`${file.name}-${file.size}-${index}`} className="grid gap-1 rounded-xl bg-slate-50 p-3"><div className="flex min-w-0 items-center justify-between gap-3 text-sm"><p className="min-w-0 flex-1 truncate font-semibold" title={file.name}>{file.name}</p><span className="shrink-0 text-xs text-slate-500">{file.percent}%</span></div><div className="flex items-center justify-between gap-3 text-xs text-slate-500"><span>{formatBytes(file.size)}</span><span className={file.status === 'error' ? 'font-semibold text-red-600' : file.status === 'done' ? 'font-semibold text-emerald-600' : 'font-semibold text-blue-600'}>{file.status === 'error' ? 'Failed' : file.status === 'done' ? 'Done' : file.percent >= 99 ? 'Processing' : 'Uploading'}</span></div><div className="h-1.5 rounded-full bg-slate-200"><div className={file.status === 'error' ? 'h-full rounded-full bg-red-500' : file.status === 'done' ? 'h-full rounded-full bg-emerald-500' : 'h-full rounded-full bg-blue-600'} style={{ width: `${file.percent}%` }} /></div></div>)}</div> : null}
-          </div>
-        </div>
-      ) : null}
+      <FilePreview
+        open={previewOpen}
+        file={activeFile}
+        previewUrl={previewUrl}
+        previewError={previewError}
+        previewLoading={previewLoading}
+        previewZoom={previewZoom}
+        previewPanX={previewPanX}
+        previewPanY={previewPanY}
+        previewRotateX={previewRotateX}
+        previewRotateY={previewRotateY}
+        preview3DEnabled={preview3DEnabled}
+        previewIsDragging={previewIsDragging}
+        onClose={closePreview}
+        onDownload={downloadFile}
+        onShare={shareFile}
+        onOpenInGoogleEditor={openInGoogleEditor}
+        setPreviewZoom={setPreviewZoom}
+        setPreviewPanX={setPreviewPanX}
+        setPreviewPanY={setPreviewPanY}
+        setPreviewRotateX={setPreviewRotateX}
+        setPreviewRotateY={setPreviewRotateY}
+        setPreview3DEnabled={setPreview3DEnabled}
+        setPreviewIsDragging={setPreviewIsDragging}
+        previewIsDraggingRef={previewIsDraggingRef}
+        previewDragRef={previewDragRef}
+        previewContainerRef={previewContainerRef}
+      />
+       {uploadProgress.open ? <UploadProgressPanel progress={uploadProgress} onClose={() => setUploadProgress((current) => ({ ...current, open: false }))} /> : null}
     </>
   )
 }

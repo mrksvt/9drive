@@ -5,16 +5,20 @@ import { google } from 'googleapis'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
+import { createRequestLogger } from '../../utils/logger.js'
+import { sanitizeFileName } from '../../utils/sanitize.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 
 export const uploadRouter = Router()
 
+const log = createRequestLogger('upload')
+
 type UploadMeta = { fieldName: string; fileName: string; mimeType: string; sizeBytes: bigint; folderId?: string }
 type RoutingMode = 'most_available' | 'round_robin' | 'priority'
 
 function logUpload(message: string, metadata?: Record<string, unknown>) {
-  console.info('[upload]', message, metadata ?? '')
+  log.info(metadata ?? {}, message)
 }
 
 function syncQuotaInBackground(accountId: string, sessionId: string) {
@@ -40,7 +44,7 @@ function byPriority<T extends { account: { id: string; createdAt: Date } }>(item
   })
 }
 
-async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByAccount = new Map<string, bigint>()) {
+export async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByAccount = new Map<string, bigint>()) {
   const accounts = await prisma.connectedAccount.findMany({
     where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected' },
     include: { storageAccount: true },
@@ -111,7 +115,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
 
     const parseBatchMeta = (value: string) => JSON.parse(value).map((item: { fieldName: string; fileName: string; mimeType: string; sizeBytes: string | number; folderId?: string }) => ({
       fieldName: item.fieldName,
-      fileName: item.fileName,
+      fileName: sanitizeFileName(item.fileName),
       mimeType: item.mimeType,
       sizeBytes: BigInt(item.sizeBytes),
       folderId: item.folderId,
@@ -126,7 +130,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
 
     const uploadOne = async (fieldName: string, fileStream: NodeJS.ReadableStream, info: { filename: string; mimeType: string }) => {
       const meta = metaForFile(fieldName, info)
-      const fileName = meta?.fileName || info.filename
+      const fileName = sanitizeFileName(meta?.fileName || info.filename)
       try {
         fileStream.on('limit', () => logUpload('file stream size limit reached', { fileName }))
         if (!meta?.sizeBytes || meta.sizeBytes <= 0n) {

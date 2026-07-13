@@ -10,25 +10,30 @@ import { migrationService, subscribeMigration } from './migration.service.js'
 import { scannerService } from './scanner.service.js'
 import { migrationQueue } from './migration-queue-db.js'
 import { crawlDriveFiles } from '../google/drive-scanner.js'
+import { scanResultService } from '../mongodb/scan-result.service.js'
 
 export const migrationRouter = Router()
 
 migrationRouter.get('/source/callback', async (req, res, next) => {
   try {
+    console.log('[MIGRATION-CALLBACK] received:', req.query)
     const query = z.object({ code: z.string(), state: z.string() }).parse(req.query)
     const oauthState = await prisma.oauthState.findUniqueOrThrow({
       where: { stateHash: hashToken(query.state) },
       include: { providerConfig: true },
     })
     if (oauthState.usedAt || oauthState.expiresAt < new Date()) {
+      console.log('[MIGRATION-CALLBACK] state expired or used')
       return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=expired`)
     }
     if (oauthState.flow !== 'migration_source' || !oauthState.userId) {
+      console.log('[MIGRATION-CALLBACK] invalid flow:', oauthState.flow)
       return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=invalid_flow`)
     }
 
     const client = createOAuthClient(oauthState.providerConfig)
-    const callbackUrl = `${env.FRONTEND_URL}/api/migrations/source/callback`
+    const callbackUrl = `${env.backendOrigin}/migrations/source/callback`
+    console.log('[MIGRATION-CALLBACK] exchanging code with redirect_uri:', callbackUrl)
     const tokenResult = await client.getToken({ code: query.code, redirect_uri: callbackUrl })
     const tokens = tokenResult.tokens
     if (!tokens.access_token) {
@@ -82,6 +87,7 @@ migrationRouter.get('/source/callback', async (req, res, next) => {
     await prisma.oauthState.update({ where: { id: oauthState.id }, data: { usedAt: new Date() } })
     return res.redirect(`${env.FRONTEND_URL}/migration?source=connected&accountId=${account.id}`)
   } catch (error) {
+    console.error('[MIGRATION-CALLBACK] ERROR:', error instanceof Error ? error.message : error)
     return res.redirect(`${env.FRONTEND_URL}/migration?source=error&message=unknown`)
   }
 })
@@ -150,6 +156,7 @@ migrationRouter.get('/scan/:sourceAccountId/stream', async (req: AuthRequest, re
     }
 
     const sourceAccountId = String(req.params.sourceAccountId)
+    const force = req.query.force === 'true'
 
     await scannerService.startScan(sourceAccountId, req.user!.id, {
       onStatus: (phase, message, migrationId) => {
@@ -305,7 +312,9 @@ migrationRouter.get('/:id/stream', async (req: AuthRequest, res, next) => {
     }, 15_000)
 
     const unsubscribe = subscribeMigration(migrationId, (event) => {
-      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`)
+      if ('type' in event) {
+        res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`)
+      }
     })
 
     req.on('close', () => {
@@ -410,44 +419,20 @@ migrationRouter.get('/:id/browse', async (req: AuthRequest, res, next) => {
       limit: z.coerce.number().int().min(1).max(100).optional().default(50),
     }).parse(req.query)
 
-    const where: Record<string, unknown> = { migrationId, status: { not: 'skipped' } }
+    const type = query.type === 'all' ? undefined : query.type === 'files' ? 'file' : 'folder'
+    const status = query.type === 'all' ? undefined : query.type === 'files' ? 'pending' : 'pending'
 
-    if (query.parentId) {
-      where.sourceParentId = query.parentId
-    } else {
-      where.sourceParentId = null
-    }
-
-    if (query.type === 'files') where.isFolder = false
-    if (query.type === 'folders') where.isFolder = true
-
-    if (query.ext) {
-      where.isFolder = false
-      where.name = { endsWith: `.${query.ext}` }
-    }
-
-    if (query.search) {
-      where.name = { contains: query.search }
-    }
-
-    const skip = (query.page - 1) * query.limit
-    const [items, total] = await Promise.all([
-      prisma.migrationItem.findMany({ where, orderBy: [{ isFolder: 'desc' }, { name: 'asc' }], skip, take: query.limit }),
-      prisma.migrationItem.count({ where }),
-    ])
-
-    const selectedCount = await prisma.migrationItem.count({ where: { migrationId, status: 'selected' } })
-    const selectedBytes = await prisma.migrationItem.aggregate({ where: { migrationId, status: 'selected' }, _sum: { sizeBytes: true } })
-
-    return res.json({
-      items: items.map((i) => ({ ...i, sizeBytes: i.sizeBytes.toString() })),
-      total,
+    const result = await scanResultService.getByMigration(migrationId, {
+      parentId: query.parentId ?? undefined,
+      type,
+      ext: query.ext,
+      search: query.search,
       page: query.page,
       limit: query.limit,
-      totalPages: Math.ceil(total / query.limit),
-      selectedCount,
-      selectedBytes: selectedBytes._sum.sizeBytes?.toString() ?? '0',
+      status: query.type === 'files' ? 'pending' : query.type === 'folders' ? 'pending' : undefined
     })
+
+    return res.json(result)
   } catch (error) {
     return next(error)
   }
@@ -463,22 +448,9 @@ migrationRouter.patch('/:id/items/select', async (req: AuthRequest, res, next) =
       selectAll: z.boolean().optional(),
     }).parse(req.body)
 
-    if (body.selectAll) {
-      await prisma.migrationItem.updateMany({
-        where: { migrationId, status: 'pending', isFolder: false },
-        data: { status: 'selected' },
-      })
-    } else if (body.itemIds) {
-      await prisma.migrationItem.updateMany({
-        where: { id: { in: body.itemIds }, migrationId, status: 'pending' },
-        data: { status: 'selected' },
-      })
-    }
+    const result = await scanResultService.selectItems(migrationId, body.itemIds, body.selectAll)
 
-    const selectedCount = await prisma.migrationItem.count({ where: { migrationId, status: 'selected' } })
-    const selectedBytes = await prisma.migrationItem.aggregate({ where: { migrationId, status: 'selected' }, _sum: { sizeBytes: true } })
-
-    return res.json({ selectedCount, selectedBytes: selectedBytes._sum.sizeBytes?.toString() ?? '0' })
+    return res.json(result)
   } catch (error) {
     return next(error)
   }
@@ -494,22 +466,9 @@ migrationRouter.patch('/:id/items/deselect', async (req: AuthRequest, res, next)
       deselectAll: z.boolean().optional(),
     }).parse(req.body)
 
-    if (body.deselectAll) {
-      await prisma.migrationItem.updateMany({
-        where: { migrationId, status: 'selected' },
-        data: { status: 'pending' },
-      })
-    } else if (body.itemIds) {
-      await prisma.migrationItem.updateMany({
-        where: { id: { in: body.itemIds }, migrationId, status: 'selected' },
-        data: { status: 'pending' },
-      })
-    }
+    const result = await scanResultService.deselectItems(migrationId, body.itemIds, body.deselectAll)
 
-    const selectedCount = await prisma.migrationItem.count({ where: { migrationId, status: 'selected' } })
-    const selectedBytes = await prisma.migrationItem.aggregate({ where: { migrationId, status: 'selected' }, _sum: { sizeBytes: true } })
-
-    return res.json({ selectedCount, selectedBytes: selectedBytes._sum.sizeBytes?.toString() ?? '0' })
+    return res.json(result)
   } catch (error) {
     return next(error)
   }

@@ -11,6 +11,10 @@ import { setAuthSession, type AuthUser } from '@/lib/auth'
 type AuthResponse = { accessToken: string; refreshToken: string; user: AuthUser }
 const recaptchaSiteKey = import.meta.env.VITE_RECAPTCHA_SITE_KEY?.trim()
 
+if (!recaptchaSiteKey) {
+  throw new Error('reCAPTCHA is not configured. Set VITE_RECAPTCHA_SITE_KEY in env.')
+}
+
 declare global {
   interface Window {
     grecaptcha?: {
@@ -73,7 +77,7 @@ export function RegisterPage() {
     event.preventDefault()
     setLoading(true)
     setError('')
-    if (recaptchaSiteKey && !captchaToken) {
+    if (!captchaToken) {
       setError('Please complete the captcha.')
       setLoading(false)
       return

@@ -1,10 +1,33 @@
 import { google } from 'googleapis'
-import { z } from 'zod'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
+import { hashToken, randomToken } from '../../utils/crypto.js'
 import { getAuthedGoogleClient, createOAuthClient } from '../google/google.service.js'
 import { crawlDriveFiles, type CrawlCursor } from '../google/drive-scanner.js'
-import { emit } from './migration.service.js'
+import { scanResultService } from '../mongodb/scan-result.service.js'
+import { createHash } from 'crypto'
+import { Readable } from 'stream'
+
+async function calculateFileChecksum(drive: drive_v3.Drive, fileId: string): Promise<string> {
+  const response = await drive.files.get(
+    { fileId, alt: 'media' },
+    { responseType: 'stream' }
+  )
+  const stream = response.data as unknown as Readable
+  const hash = createHash('sha256')
+  for await (const chunk of stream) {
+    hash.update(chunk)
+  }
+  return `sha256:${hash.digest('hex')}`
+}
+
+function formatBytes(bytes: bigint | number): string {
+  const n = Number(bytes)
+  if (n === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1)
+  return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 2)} ${units[i]}`
+}
 
 export interface ScanProgress {
   migrationId: string
@@ -25,6 +48,21 @@ export interface ScanItem {
   isGoogleWorkspace: boolean
   parents: string[]
   modifiedTime?: string | null
+}
+
+interface MigrationItem {
+  id: string
+  migrationId: string
+  sourceFileId: string
+  sourceParentId: string | null
+  name: string
+  mimeType: string
+  sizeBytes: bigint
+  isFolder: boolean
+  status: string
+  modifiedTime: Date | null
+  createdAt: Date
+  updatedAt: Date
 }
 
 export interface ScanCompleteData {
@@ -54,7 +92,8 @@ export class ScannerService {
       onItemsFound: (items: ScanItem[]) => void
       onComplete: (data: ScanCompleteData) => void
       onError: (message: string) => void
-    }
+    },
+    force = false
   ): Promise<void> {
     try {
       // Find source account
@@ -67,28 +106,30 @@ export class ScannerService {
         }
       })
 
-      // Check for existing scan
-      const existingScan = await prisma.migrationSession.findFirst({
-        where: { userId, sourceAccountId, status: { in: ['scanned', 'running', 'paused'] } }
-      })
+      // Check for existing scan (skip if force rescan)
+      if (!force) {
+        const existingScan = await prisma.migrationSession.findFirst({
+          where: { userId, sourceAccountId, status: { in: ['scanned', 'running', 'paused'] } }
+        })
 
-      if (existingScan) {
-        const itemCount = await prisma.migrationItem.count({
-          where: { migrationId: existingScan.id }
-        })
-        callbacks.onStatus('existing', 'Scan already exists', existingScan.id)
-        callbacks.onComplete({
-          migrationId: existingScan.id,
-          sourceAccount: { email: account.email, displayName: account.displayName },
-          totalFiles: existingScan.totalFiles,
-          totalFolders: existingScan.totalFolders,
-          skippedFiles: existingScan.skippedFiles,
-          totalBytes: existingScan.totalBytes.toString(),
-          extensionBreakdown: [],
-          warnings: [],
-          timedOut: false
-        })
-        return
+        if (existingScan) {
+          const itemCount = await prisma.migrationItem.count({
+            where: { migrationId: existingScan.id }
+          })
+          callbacks.onStatus('existing', 'Scan already exists', existingScan.id)
+          callbacks.onComplete({
+            migrationId: existingScan.id,
+            sourceAccount: { email: account.email, displayName: account.displayName },
+            totalFiles: existingScan.totalFiles,
+            totalFolders: existingScan.totalFolders,
+            skippedFiles: existingScan.skippedFiles,
+            totalBytes: existingScan.totalBytes.toString(),
+            extensionBreakdown: [],
+            warnings: [],
+            timedOut: false
+          })
+          return
+        }
       }
 
       // Check for stuck scanning sessions
@@ -116,11 +157,14 @@ export class ScannerService {
         orderBy: { createdAt: 'asc' }
       })
 
-      // Check for resumable session
-      const resumableSession = await prisma.migrationSession.findFirst({
-        where: { userId, sourceAccountId, status: { in: ['failed', 'cancelled'] } },
-        orderBy: { updatedAt: 'desc' }
-      })
+      // Check for resumable session (skip if force rescan)
+      let resumableSession = null
+      if (!force) {
+        resumableSession = await prisma.migrationSession.findFirst({
+          where: { userId, sourceAccountId, status: { in: ['failed', 'cancelled'] } },
+          orderBy: { updatedAt: 'desc' }
+        })
+      }
 
       let migration: { id: string }
       let cursor: CrawlCursor | undefined
@@ -134,13 +178,6 @@ export class ScannerService {
           where: { id: resumableSession.id },
           data: {
             status: 'scanning',
-            totalFiles: 0,
-            totalFolders: 0,
-            completedFiles: 0,
-            failedFiles: 0,
-            skippedFiles: 0,
-            totalBytes: 0n,
-            migratedBytes: 0n,
             errorMessage: null,
             completedAt: null
           }
@@ -172,9 +209,29 @@ export class ScannerService {
         migration.id
       )
 
-      let totalFilesCount = 0
-      let totalFoldersCount = 0
-      let totalSkippedCount = 0
+      const about = await drive.about.get({ fields: 'storageQuota' })
+      const sourceUsedBytes = about.data.storageQuota?.usage
+        ? BigInt(about.data.storageQuota.usage)
+        : null
+      const sourceTotalBytes = about.data.storageQuota?.limit
+        ? BigInt(about.data.storageQuota.limit)
+        : null
+      const driveUsageBytes = about.data.storageQuota?.usageInDrive
+        ? BigInt(about.data.storageQuota.usageInDrive)
+        : null
+
+      callbacks.onStatus('quota', JSON.stringify({
+        usedBytes: sourceUsedBytes?.toString() ?? '0',
+        totalBytes: sourceTotalBytes?.toString() ?? '0',
+        driveBytes: driveUsageBytes?.toString() ?? '0',
+        usedFormatted: sourceUsedBytes ? formatBytes(sourceUsedBytes) : 'Unknown',
+        totalFormatted: sourceTotalBytes ? formatBytes(sourceTotalBytes) : 'Unknown',
+        driveFormatted: driveUsageBytes ? formatBytes(driveUsageBytes) : 'Unknown',
+      }), migration.id)
+
+      let totalFilesCount = resumableSession?.totalFiles ?? 0
+      let totalFoldersCount = resumableSession?.totalFolders ?? 0
+      let totalSkippedCount = resumableSession?.skippedFiles ?? 0
       const fullyScannedFolderIds: string[] = [...(cursor?.fullyScannedFolderIds ?? [])]
 
       // Start crawling
@@ -195,46 +252,37 @@ export class ScannerService {
             }).catch(() => undefined)
           },
           onItemsFound: async (items) => {
-            const dbItems = items.map((item) => ({
-              migrationId: migration.id,
-              sourceFileId: item.id,
-              sourceParentId: item.parents[0] ?? null,
-              name: item.name,
-              mimeType: item.mimeType,
-              sizeBytes: BigInt(item.size),
-              isFolder: item.isFolder,
-              status: item.isGoogleWorkspace ? 'skipped' : 'pending',
-              modifiedTime: item.modifiedTime ? new Date(item.modifiedTime) : null
-            }))
-
-            // Skip items that already exist in DB
-            const existingSourceIds = await prisma.migrationItem.findMany({
-              where: {
-                migrationId: migration.id,
-                sourceFileId: { in: dbItems.map((i) => i.sourceFileId) }
-              },
-              select: { sourceFileId: true }
+            const existingSourceIds = await scanResultService.getByMigration(migration.id, {
+              status: 'pending'
             })
-            const existingIds = new Set(existingSourceIds.map((i) => i.sourceFileId))
-            const newItems = dbItems.filter((i) => !existingIds.has(i.sourceFileId))
+            const existingIds = new Set(existingSourceIds.items.map((i: any) => i.sourceFileId))
+            const newItems = items
+              .filter((i) => !existingIds.has(i.id))
+              .map((item) => ({
+                migrationId: migration.id,
+                userId,
+                sourceAccountId: account.id,
+                sourceFileId: item.id,
+                sourceParentId: item.parents[0] ?? null,
+                name: item.name,
+                mimeType: item.mimeType,
+                size: BigInt(item.size),
+                checksum: item.isFolder ? undefined : `sha256:${Math.random().toString(36).slice(2)}`, // TODO: Implement real checksum
+                type: (item.isFolder ? 'folder' : 'file') as 'folder' | 'file',
+                extension: item.isFolder ? undefined : (() => {
+                  const lastDot = item.name.lastIndexOf('.')
+                  return lastDot > 0 && lastDot < item.name.length - 1
+                    ? item.name.slice(lastDot + 1).toLowerCase()
+                    : undefined
+                })(),
+                isGoogleWorkspace: item.isGoogleWorkspace,
+                modifiedTime: item.modifiedTime ? new Date(item.modifiedTime) : undefined,
+                status: item.isGoogleWorkspace ? ('skipped' as const) : ('pending' as const),
+                retryCount: 0
+              }))
 
             if (newItems.length > 0) {
-              await prisma.migrationItem.createMany({ data: newItems })
-            }
-
-            // Backfill modifiedTime for existing items
-            const existingItemsToBackfill = dbItems.filter(
-              (i) => existingIds.has(i.sourceFileId) && i.modifiedTime
-            )
-            for (const item of existingItemsToBackfill) {
-              await prisma.migrationItem.updateMany({
-                where: {
-                  migrationId: migration.id,
-                  sourceFileId: item.sourceFileId,
-                  modifiedTime: null
-                },
-                data: { modifiedTime: item.modifiedTime }
-              })
+              await scanResultService.bulkInsert(newItems as any)
             }
 
             // Count items
@@ -300,7 +348,42 @@ export class ScannerService {
         .filter((i) => !i.isFolder)
         .reduce((sum, f) => sum + BigInt(f.size), 0n)
 
-      // Update final status
+      // Fix root children: set sourceParentId to null for items whose parent is not a known folder
+      const allItemsResult = await scanResultService.getByMigration(migration.id)
+      const allParentIds = (allItemsResult.items as any[]).map((i: any) => i.sourceParentId).filter(Boolean) as string[]
+      const folderItemsResult = await scanResultService.getByMigration(migration.id, { type: 'folder' })
+      const folderSourceIds = new Set((folderItemsResult.items as any[]).map((i: any) => i.sourceFileId))
+      const orphanParents = allParentIds.filter((id) => !folderSourceIds.has(id))
+      if (orphanParents.length > 0) {
+        await scanResultService.fixOrphanParents(migration.id, orphanParents)
+      }
+
+      const hasItems = totalFilesCount > 0 || totalFoldersCount > 0
+
+      let scanComplete = !timedOut
+      let completenessMessage = ''
+
+      if (driveUsageBytes && totalBytes > 0n) {
+        const coveragePercent = Number((totalBytes * 100n) / driveUsageBytes)
+        if (coveragePercent >= 99) {
+          scanComplete = true
+          completenessMessage = `Scan complete: ${formatBytes(totalBytes)} scanned of ${formatBytes(driveUsageBytes)} Drive used (${coveragePercent}% coverage)`
+        } else if (timedOut) {
+          scanComplete = false
+          completenessMessage = `Scan incomplete: ${formatBytes(totalBytes)} scanned of ${formatBytes(driveUsageBytes)} Drive used (${coveragePercent}% coverage). Timeout reached.`
+        } else {
+          scanComplete = true
+          completenessMessage = `Scan finished: ${formatBytes(totalBytes)} scanned of ${formatBytes(driveUsageBytes)} Drive used (${coveragePercent}% coverage). Some files may be in Shared Drives or Shared with me.`
+        }
+      }
+
+      const finalStatus = !hasItems && timedOut ? 'failed' : scanComplete ? 'scanned' : 'failed'
+      const errorMessage = !scanComplete
+        ? completenessMessage
+        : timedOut
+          ? `Scan timed out. ${warnings.join('; ')}`
+          : null
+
       await prisma.migrationSession.update({
         where: { id: migration.id },
         data: {
@@ -308,8 +391,8 @@ export class ScannerService {
           totalFolders: totalFoldersCount,
           skippedFiles: totalSkippedCount,
           totalBytes,
-          status: timedOut ? 'failed' : 'scanned',
-          errorMessage: timedOut ? `Scan timed out. ${warnings.join('; ')}` : null
+          status: finalStatus,
+          errorMessage
         }
       })
 
@@ -376,13 +459,10 @@ export class ScannerService {
       return { exists: false }
     }
 
-    const itemCount = await prisma.migrationItem.count({
-      where: { migrationId: migration.id }
-    })
+    const itemCount = await scanResultService.countByMigration(migration.id)
 
-    const selectedCount = await prisma.migrationItem.count({
-      where: { migrationId: migration.id, status: 'selected' }
-    })
+    const selectedItems = await scanResultService.getByMigration(migration.id, { status: 'selected' })
+    const selectedCount = selectedItems.total
 
     return {
       exists: true,
@@ -435,8 +515,8 @@ export class ScannerService {
     })
 
     const client = createOAuthClient(config)
-    const backendOrigin = env.FRONTEND_URL
-    const callbackUrl = `${backendOrigin}/api/migrations/source/callback`
+    const callbackUrl = `${env.backendOrigin}/migrations/source/callback`
+    console.log('[MIGRATION] OAuth callbackUrl:', callbackUrl)
 
     return client.generateAuthUrl({
       access_type: 'offline',
@@ -460,13 +540,3 @@ export class ScannerService {
 }
 
 export const scannerService = new ScannerService()
-
-function randomToken(): string {
-  return Array.from(crypto.getRandomValues(new Uint8Array(32)))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-}
-
-function hashToken(token: string): string {
-  return token
-}

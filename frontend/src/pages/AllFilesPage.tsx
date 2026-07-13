@@ -100,6 +100,7 @@ export function AllFilesPage() {
   const [shareMode, setShareMode] = useState<'9drive' | 'google_drive'>('9drive')
   const [shareAccess, setShareAccess] = useState<'public' | 'email'>('public')
   const [shareEmail, setShareEmail] = useState('')
+  const [sharePassword, setSharePassword] = useState('')
   const [shareLoading, setShareLoading] = useState(false)
   const [previewUrl, setPreviewUrl] = useState('')
   const [previewError, setPreviewError] = useState('')
@@ -478,6 +479,23 @@ async function loadFiles() {
     }
   }
 
+  async function generateShareLink() {
+    if (!activeFile?.id) return
+    setShareLoading(true)
+    try {
+      const data = await apiFetch<{ url: string }>(`/files/${activeFile.id}/share`, {
+        method: 'POST',
+        body: JSON.stringify({ password: sharePassword || undefined })
+      })
+      setShareUrl(data.url)
+      setCopiedShareLink(false)
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to generate share link')
+    } finally {
+      setShareLoading(false)
+    }
+  }
+
   async function inviteToFile() {
     if (!activeFile?.id) return
     setInviteTargetType('file')
@@ -629,9 +647,20 @@ async function loadFiles() {
       <DummyModal open={shareOpen} title="Share" description={activeFile?.name ?? ''} onClose={() => setShareOpen(false)} overlayClassName="z-[70]">
         <div className="grid gap-4">
           <div className="flex gap-2">
-            <Button variant={shareMode === '9drive' ? 'default' : 'outline'} size="sm" onClick={() => { setShareMode('9drive'); setShareUrl(''); if (activeFile?.id) apiFetch<{ url: string }>(`/files/${activeFile.id}/share`, { method: 'POST' }).then((d) => setShareUrl(d.url)) }}>9Drive Link</Button>
-            <Button variant={shareMode === 'google_drive' ? 'default' : 'outline'} size="sm" onClick={() => { setShareMode('google_drive'); setShareUrl('') }}>Google Drive Link</Button>
+            <Button variant={shareMode === '9drive' ? 'default' : 'outline'} size="sm" onClick={() => { setShareMode('9drive'); setShareUrl(''); setSharePassword(''); if (activeFile?.id) apiFetch<{ url: string }>(`/files/${activeFile.id}/share`, { method: 'POST' }).then((d) => setShareUrl(d.url)) }}>9Drive Link</Button>
+            <Button variant={shareMode === 'google_drive' ? 'default' : 'outline'} size="sm" onClick={() => { setShareMode('google_drive'); setShareUrl(''); setSharePassword('') }}>Google Drive Link</Button>
           </div>
+          {shareMode === '9drive' ? (
+            <div className="grid gap-3 rounded-xl bg-slate-50 p-3">
+              <label className="grid gap-2 text-sm font-semibold">
+                Password (Optional)
+                <Input type="password" value={sharePassword} onChange={(event) => setSharePassword(event.target.value)} placeholder="Leave empty for no password" />
+              </label>
+              <Button onClick={generateShareLink} disabled={shareLoading}>
+                {shareLoading ? 'Generating...' : 'Generate Link'}
+              </Button>
+            </div>
+          ) : null}
           {shareMode === 'google_drive' ? (
             <div className="grid gap-3 rounded-xl bg-slate-50 p-3">
               <p className="text-xs font-semibold text-slate-500">Access</p>

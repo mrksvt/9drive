@@ -15,9 +15,8 @@ const GOOGLE_WORKSPACE_MIME_TYPES = new Set([
   'application/vnd.google-apps.shortcut',
 ])
 
-const MAX_DEPTH = 50
 const API_TIMEOUT_MS = 30_000
-const OVERALL_TIMEOUT_MS = 30 * 60_000
+const OVERALL_TIMEOUT_MS = 60 * 60_000
 
 export type CrawledItem = {
   id: string
@@ -78,7 +77,6 @@ export async function crawlDriveFiles(
   const warnings: string[] = []
   let pages = 0
   let timedOut = false
-  const skipFolderIds = new Set(cursor?.fullyScannedFolderIds ?? [])
   const startTime = Date.now()
 
   function checkOverallTimeout(): boolean {
@@ -104,128 +102,84 @@ export async function crawlDriveFiles(
     }
   }
 
-  async function crawlFolder(folderId: string | undefined, currentPath: string, depth: number) {
-    if (depth > MAX_DEPTH) {
-      warnings.push(`Max depth ${MAX_DEPTH} reached at ${currentPath}`)
-      return
-    }
-
-    if (checkOverallTimeout()) return
-
-    if (folderId && skipFolderIds.has(folderId)) {
-      return
-    }
-
+  try {
+    console.log(`[Scanner] Starting flat scan (all files, no parent filter)`)
     let pageToken: string | undefined
-    const subfolders: drive_v3.Schema$File[] = []
 
-    try {
-      do {
-        if (checkOverallTimeout()) return
+    do {
+      if (checkOverallTimeout()) {
+        console.warn(`[Scanner] Timeout during pagination at page ${pages}`)
+        break
+      }
 
-        const parentQuery = folderId ? `'${folderId}' in parents` : `'root' in parents`
-        const response = await withTimeout(
-          drive.files.list({
-            q: `${parentQuery} and trashed = false`,
-            spaces: 'drive',
-            fields: 'nextPageToken,files(id,name,mimeType,size,parents,modifiedTime)',
-            pageSize: 1000,
-            pageToken,
-          }),
-          API_TIMEOUT_MS,
-          `API call at ${currentPath}`
-        )
+      const response = await withTimeout(
+        drive.files.list({
+          q: 'trashed = false',
+          spaces: 'drive',
+          fields: 'nextPageToken,files(id,name,mimeType,size,parents,modifiedTime)',
+          pageSize: 1000,
+          pageToken,
+        }),
+        API_TIMEOUT_MS,
+        `API call page ${pages}`
+      )
 
-        for (const file of response.data.files ?? []) {
-          if (!file.id || !file.name || !file.mimeType) continue
-          if (seen.has(file.id)) continue
-          seen.add(file.id)
+      const files = response.data.files ?? []
+      console.log(`[Scanner] Page ${pages}: ${files.length} items, nextPageToken=${!!response.data.nextPageToken}`)
 
-          if (file.mimeType === googleDriveFolderMimeType) {
-            subfolders.push(file)
-          } else {
-            const isGoogleWorkspace = GOOGLE_WORKSPACE_MIME_TYPES.has(file.mimeType)
-            allItems.push({
-              id: file.id,
-              name: file.name,
-              mimeType: file.mimeType,
-              size: Number(file.size ?? 0),
-              parents: (file.parents ?? []).filter((p): p is string => typeof p === 'string'),
-              isFolder: false,
-              isGoogleWorkspace,
-              modifiedTime: file.modifiedTime ?? null,
-            })
-          }
+      const pageItems: CrawledItem[] = []
+
+      for (const file of files) {
+        if (!file.id || !file.name || !file.mimeType) continue
+        if (seen.has(file.id)) continue
+        seen.add(file.id)
+
+        const isFolder = file.mimeType === googleDriveFolderMimeType
+        const isGoogleWorkspace = GOOGLE_WORKSPACE_MIME_TYPES.has(file.mimeType)
+        const fileSize = Number(file.size ?? 0)
+
+        const item: CrawledItem = {
+          id: file.id,
+          name: file.name,
+          mimeType: file.mimeType,
+          size: isFolder ? 0 : fileSize,
+          parents: (file.parents ?? []).filter((p): p is string => typeof p === 'string'),
+          isFolder,
+          isGoogleWorkspace,
+          modifiedTime: file.modifiedTime ?? null,
         }
 
-        pages++
+        allItems.push(item)
+        pageItems.push(item)
+      }
 
-        const pageItems = (response.data.files ?? [])
-          .filter((f) => f.id && f.name && f.mimeType && seen.has(f.id))
-          .map((f) => ({
-            id: f.id!,
-            name: f.name!,
-            mimeType: f.mimeType!,
-            size: Number(f.size ?? 0),
-            parents: (f.parents ?? []).filter((p): p is string => typeof p === 'string'),
-            isFolder: f.mimeType === googleDriveFolderMimeType,
-            isGoogleWorkspace: GOOGLE_WORKSPACE_MIME_TYPES.has(f.mimeType!),
-            modifiedTime: f.modifiedTime ?? null,
-          }))
-        if (callbacks.onItemsFound && pageItems.length > 0) await callbacks.onItemsFound(pageItems)
+      pages++
 
-        emitProgress(currentPath)
+      if (callbacks.onItemsFound && pageItems.length > 0) {
+        await callbacks.onItemsFound(pageItems)
+      }
 
-        pageToken = response.data.nextPageToken ?? undefined
-      } while (pageToken)
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error)
-      warnings.push(`Error scanning ${currentPath}: ${errorMsg}`)
-      emitProgress(currentPath)
+      emitProgress(`page ${pages}`)
+
+      pageToken = response.data.nextPageToken ?? undefined
+    } while (pageToken)
+
+    if (callbacks.onFolderComplete) {
+      for (const item of allItems.filter((i) => i.isFolder)) {
+        await callbacks.onFolderComplete(item.id)
+      }
     }
-
-    subfolders.sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''))
-
-    for (const folder of subfolders) {
-      if (!folder.id || !folder.name) continue
-
-      if (skipFolderIds.has(folder.id)) continue
-
-      const subPath = `${currentPath}/${folder.name}`
-      allItems.push({
-        id: folder.id,
-        name: folder.name,
-        mimeType: googleDriveFolderMimeType,
-        size: 0,
-        parents: (folder.parents ?? []).filter((p): p is string => typeof p === 'string'),
-        isFolder: true,
-        isGoogleWorkspace: false,
-        modifiedTime: folder.modifiedTime ?? null,
-      })
-
-      emitProgress(subPath)
-
-      await crawlFolder(folder.id, subPath, depth + 1)
-
-      if (timedOut) return
-    }
-
-    if (folderId && callbacks.onFolderComplete && !timedOut) {
-      await callbacks.onFolderComplete(folderId)
-    }
-  }
-
-  try {
-    await withTimeout(
-      crawlFolder(rootFolderId, rootPath, 0),
-      OVERALL_TIMEOUT_MS,
-      'Overall scan'
-    )
   } catch (error) {
     timedOut = true
     const errorMsg = error instanceof Error ? error.message : String(error)
     warnings.push(`Scan failed: ${errorMsg}`)
+    console.error(`[Scanner] Scan failed: ${errorMsg}`)
   }
+
+  const totalFiles = allItems.filter((i) => !i.isFolder && !i.isGoogleWorkspace).length
+  const totalFolders = allItems.filter((i) => i.isFolder).length
+  const totalBytes = allItems.filter((i) => !i.isFolder).reduce((s, i) => s + i.size, 0)
+  console.log(`[Scanner] Scan complete: ${totalFiles} files, ${totalFolders} folders, ${totalBytes} bytes, timedOut=${timedOut}, elapsed=${Date.now() - startTime}ms`)
 
   return { items: allItems, warnings, timedOut }
 }

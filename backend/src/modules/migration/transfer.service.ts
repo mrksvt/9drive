@@ -3,6 +3,7 @@ import { prisma } from '../../config/prisma.js'
 import { getAuthedGoogleClient, ensureGoogleAppFolder, syncGoogleQuota } from '../google/google.service.js'
 import { migrateFile } from './file-migrator.js'
 import { emit } from './migration.service.js'
+import { scanResultService } from '../mongodb/scan-result.service.js'
 import type { ConnectedAccount } from '@prisma/client'
 
 export interface TransferProgress {
@@ -43,14 +44,21 @@ export class TransferService {
     const sourceAuth = await getAuthedGoogleClient(sourceAccount)
     const sourceDrive = google.drive({ version: 'v3', auth: sourceAuth })
 
-    // Get all selected items
-    const allSelected = await prisma.migrationItem.findMany({
-      where: { migrationId, status: 'selected' },
-      orderBy: [{ isFolder: 'desc' }, { createdAt: 'asc' }]
-    })
+    // Get all selected items from MongoDB
+    const allSelected = await scanResultService.getSelectedItems(migrationId)
 
-    const folderItems = allSelected.filter((i) => i.isFolder)
-    const fileItems = allSelected.filter((i) => !i.isFolder)
+    const folderItems = allSelected.filter((i) => i.type === 'folder') as Array<{
+      sourceFileId: string
+      sourceParentId: string | null
+      name: string
+    }>
+    const fileItems = allSelected.filter((i) => i.type === 'file') as Array<{
+      sourceFileId: string
+      sourceParentId: string | null
+      name: string
+      size: number | bigint
+      mimeType: string
+    }>
 
     // Map source folder IDs to created virtual folder IDs
     const sourceIdToFolderId = new Map<string, string>()
@@ -65,6 +73,7 @@ export class TransferService {
 
     // Phase 1: Create folders
     await this.createFolders(
+      migrationId,
       folderItems,
       migration.userId,
       folderAccount?.id ?? null,
@@ -77,9 +86,11 @@ export class TransferService {
     let completedFiles = 0
     let failedFiles = 0
     let migratedBytes = 0n
-    const skippedItems = await prisma.migrationItem.findMany({
-      where: { migrationId, status: 'skipped' }
-    })
+    const skippedItems = await scanResultService.getByMigration(migrationId, { status: 'skipped' })
+    const skippedList = skippedItems.items as Array<{
+      sourceFileId: string
+      name: string
+    }>
     const reservedBytesByAccount = new Map<string, bigint>()
 
     for (const item of fileItems) {
@@ -104,10 +115,7 @@ export class TransferService {
         })
 
         if (existing) {
-          await prisma.migrationItem.update({
-            where: { id: item.id },
-            data: { status: 'skipped', targetFileId: existing.id }
-          })
+          await scanResultService.updateStatusBySourceFileId(migrationId, item.sourceFileId, 'skipped', { targetFileId: existing.id })
           await prisma.migrationSession.update({
             where: { id: migrationId },
             data: { skippedFiles: { increment: 1 } }
@@ -121,7 +129,7 @@ export class TransferService {
           data: {
             completedFiles,
             failedFiles,
-            skippedFiles: skippedItems.length,
+            skippedFiles: skippedList.length,
             currentFile: item.name,
             percentComplete:
               fileItems.length > 0
@@ -133,7 +141,7 @@ export class TransferService {
         // Select target account with enough space
         const targetAccount = await this.selectAccount(
           migration.userId,
-          item.sizeBytes,
+          BigInt(item.size),
           reservedBytesByAccount
         )
 
@@ -143,14 +151,14 @@ export class TransferService {
 
         reservedBytesByAccount.set(
           targetAccount.id,
-          (reservedBytesByAccount.get(targetAccount.id) ?? 0n) + item.sizeBytes
+          (reservedBytesByAccount.get(targetAccount.id) ?? 0n) + BigInt(item.size)
         )
 
         const targetAuth = await getAuthedGoogleClient(targetAccount)
         const targetDrive = google.drive({ version: 'v3', auth: targetAuth })
         const targetAppFolderId = await ensureGoogleAppFolder(targetAccount as any)
 
-        const providerFileId = await this.transferFile(
+        const { providerFileId, checksum } = await this.transferFile(
           sourceDrive,
           targetDrive,
           item.sourceFileId,
@@ -159,6 +167,12 @@ export class TransferService {
           item.mimeType,
           signal
         )
+
+        // Validate checksum
+        const itemData = await scanResultService.getBySourceFileId(migrationId, item.sourceFileId)
+        if (itemData?.checksum && itemData.checksum !== checksum) {
+          throw new Error(`Checksum mismatch for file ${item.name}`)
+        }
 
         // Create file record
         const file = await prisma.file.create({
@@ -170,17 +184,18 @@ export class TransferService {
             providerFileId,
             name: item.name,
             mimeType: item.mimeType,
-            sizeBytes: item.sizeBytes
+            sizeBytes: BigInt(item.size),
+            checksum
           }
         })
 
-        await prisma.migrationItem.update({
-          where: { id: item.id },
-          data: { status: 'completed', targetFileId: file.id }
+        await scanResultService.updateStatusBySourceFileId(migrationId, item.sourceFileId, 'completed', {
+          targetFileId: file.id,
+          checksum
         })
 
         completedFiles += 1
-        migratedBytes += item.sizeBytes
+        migratedBytes += BigInt(item.size)
 
         await prisma.migrationSession.update({
           where: { id: migrationId },
@@ -189,14 +204,11 @@ export class TransferService {
 
         emit(migrationId, {
           type: 'item-complete',
-          data: { itemId: item.id, name: item.name, status: 'completed' }
+          data: { itemId: item.sourceFileId, name: item.name, status: 'completed' }
         })
       } catch (error) {
         const msg = error instanceof Error ? error.message : 'File migration failed'
-        await prisma.migrationItem.update({
-          where: { id: item.id },
-          data: { status: 'failed', errorMessage: msg, retryCount: { increment: 1 } }
-        })
+        await scanResultService.updateStatusBySourceFileId(migrationId, item.sourceFileId, 'failed', { errorMessage: msg, retryCount: 0 })
         failedFiles += 1
         await prisma.migrationSession.update({
           where: { id: migrationId },
@@ -204,35 +216,69 @@ export class TransferService {
         })
         emit(migrationId, {
           type: 'item-failed',
-          data: { itemId: item.id, name: item.name, error: msg }
+          data: { itemId: item.sourceFileId, name: item.name, error: msg }
         })
       }
     }
 
     // Update final status
-    await prisma.migrationSession.update({
+    const processed = completedFiles + failedFiles + skippedList.length
+    if (processed > fileItems.length) {
+      console.error('[MIGRATION] Invalid counter detected:', { totalFiles: fileItems.length, completedFiles, failedFiles, skippedFiles: skippedList.length })
+    }
+
+    const finalStatus = signal.aborted
+      ? 'cancelled'
+      : failedFiles > 0
+        ? 'completed_with_errors'
+        : 'completed'
+
+    await tx.migrationSession.update({
       where: { id: migrationId },
       data: {
-        status: signal.aborted ? 'cancelled' : 'completed',
+        status: finalStatus,
         completedAt: new Date()
       }
+    })
+
+    // Unlock accounts
+    await tx.connectedAccount.updateMany({
+      where: { id: { in: [migration.sourceAccountId, migration.targetAccountId] } },
+      data: { lockedAt: null }
     })
 
     return {
       totalFiles: fileItems.length,
       completedFiles,
       failedFiles,
-      skippedFiles: skippedItems.length,
+      skippedFiles: skippedList.length,
       migratedBytes
     }
+  } catch (error) {
+    // Rollback: unlock accounts and mark migration as failed
+    await prisma.$executeRaw`ROLLBACK`
+    await prisma.connectedAccount.updateMany({
+      where: { id: { in: [migration.sourceAccountId, migration.targetAccountId] } },
+      data: { lockedAt: null }
+    })
+    await prisma.migrationSession.update({
+      where: { id: migrationId },
+      data: {
+        status: 'failed',
+        errorMessage: error instanceof Error ? error.message : 'Migration failed',
+        completedAt: new Date()
+      }
+    })
+    throw error
+  }
   }
 
   /**
    * Create virtual folders in database
    */
   private async createFolders(
+    migrationId: string,
     folderItems: Array<{
-      id: string
       sourceFileId: string
       sourceParentId: string | null
       name: string
@@ -283,16 +329,10 @@ export class TransferService {
         }
 
         sourceIdToFolderId.set(item.sourceFileId, folderId)
-        await prisma.migrationItem.update({
-          where: { id: item.id },
-          data: { status: 'completed', targetFolderId: folderId }
-        })
+        await scanResultService.updateStatusBySourceFileId(migrationId, item.sourceFileId, 'completed', { targetFolderId: folderId })
       } catch (error) {
         const msg = error instanceof Error ? error.message : 'Folder creation failed'
-        await prisma.migrationItem.update({
-          where: { id: item.id },
-          data: { status: 'failed', errorMessage: msg }
-        })
+        await scanResultService.updateStatusBySourceFileId(migrationId, item.sourceFileId, 'failed', { errorMessage: msg })
       }
     }
   }

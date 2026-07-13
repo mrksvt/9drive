@@ -41,15 +41,26 @@ export function PublicFilePage({ embed = false }: { embed?: boolean }) {
   const downloadUrl = `${API_URL}/public/files/${token}/download`
   const kind = getPreviewKind(file?.mimeType)
 
+  const [password, setPassword] = useState('')
+  const [passwordRequired, setPasswordRequired] = useState(false)
+
   useEffect(() => {
     setFailed(false)
-    apiFetch<{ file: PublicFile }>(`/public/files/${token}`, { skipAuth: true })
-      .then((data) => setFile(data.file))
-      .catch(() => {
-        setFile(null)
-        setFailed(true)
+    apiFetch<{ file: PublicFile }>(`/public/files/${token}`, { skipAuth: true, query: password ? { password } : {} })
+      .then((data) => {
+        setFile(data.file)
+        setPasswordRequired(false)
       })
-  }, [token])
+      .catch((error) => {
+        if (error instanceof Error && error.message.includes('Password')) {
+          setPasswordRequired(true)
+          setFile(null)
+        } else {
+          setFile(null)
+          setFailed(true)
+        }
+      })
+  }, [token, password])
 
   useEffect(() => {
     document.title = file ? `${file.name} | 9Drive` : 'Shared file | 9Drive'
@@ -73,6 +84,22 @@ export function PublicFilePage({ embed = false }: { embed?: boolean }) {
       player?.destroy()
     }
   }, [kind, previewUrl])
+
+  if (passwordRequired) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#0f1117] p-6 text-white">
+        <div className="max-w-md rounded-3xl border border-white/10 bg-white/[0.04] p-8 text-center shadow-2xl shadow-black/30">
+          <FileArchive className="mx-auto h-12 w-12 text-slate-400" />
+          <h1 className="mt-5 text-2xl font-extrabold">Password Required</h1>
+          <p className="mt-2 text-sm text-slate-400">This file is protected with a password.</p>
+          <form onSubmit={(e) => { e.preventDefault(); setPassword((e.currentTarget.elements.namedItem('password') as HTMLInputElement).value) }} className="mt-6 grid gap-4">
+            <Input type="password" name="password" placeholder="Enter password" className="bg-white/10 text-white placeholder-slate-400" required />
+            <Button type="submit">Unlock File</Button>
+          </form>
+        </div>
+      </main>
+    )
+  }
 
   if (failed) {
     return (

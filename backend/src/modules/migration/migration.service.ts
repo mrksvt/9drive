@@ -4,7 +4,9 @@ import { getAuthedGoogleClient, ensureGoogleAppFolder, syncGoogleQuota } from '.
 import { migrateFile } from './file-migrator.js'
 import { migrationQueue } from './migration-queue-db.js'
 import { transferService } from './transfer.service.js'
+import { scanResultService } from '../mongodb/scan-result.service.js'
 import { selectAccount } from '../uploads/upload.routes.js'
+import { publishMigrationEvent, subscribeMigration as redisSubscribeMigration } from '../redis/progress-pubsub.js'
 
 export type MigrationEvent =
   | { type: 'progress'; data: { completedFiles: number; failedFiles: number; skippedFiles: number; currentFile?: string; percentComplete: number } }
@@ -13,32 +15,97 @@ export type MigrationEvent =
   | { type: 'complete'; data: { totalFiles: number; completedFiles: number; failedFiles: number; skippedFiles: number } }
   | { type: 'error'; data: { message: string } }
 
-type Subscriber = (event: MigrationEvent) => void
-
-const subscribers = new Map<string, Set<Subscriber>>()
-
-export function emit(migrationId: string, event: MigrationEvent) {
-  const subs = subscribers.get(migrationId)
-  if (subs) {
-    for (const cb of subs) {
-      try { cb(event) } catch { /* ignore */ }
-    }
-  }
+export type ScanProgress = {
+  phase: string
+  message?: string
+  itemsScanned?: number
+  totalItems?: number
+  percentComplete?: number
 }
 
-export function subscribeMigration(migrationId: string, callback: Subscriber): () => void {
-  if (!subscribers.has(migrationId)) subscribers.set(migrationId, new Set())
-  subscribers.get(migrationId)!.add(callback)
-  return () => {
-    const subs = subscribers.get(migrationId)
-    if (subs) {
-      subs.delete(callback)
-      if (subs.size === 0) subscribers.delete(migrationId)
-    }
-  }
+export { subscribeMigration, emit }
+
+function subscribeMigration(migrationId: string, callback: (event: MigrationEvent | ScanProgress) => void): () => void {
+  return redisSubscribeMigration(migrationId, callback)
+}
+
+function emit(migrationId: string, event: MigrationEvent): void {
+  publishMigrationEvent(migrationId, event)
 }
 
 export class MigrationService {
+  /**
+   * Start a new migration (ACID-compliant)
+   */
+  async startMigration(sourceAccountId: string, targetAccountId: string, userId: string) {
+    // Validate accounts
+    const sourceAccount = await prisma.connectedAccount.findFirstOrThrow({
+      where: { id: sourceAccountId, userId, status: 'connected' }
+    })
+    const targetAccount = await prisma.connectedAccount.findFirstOrThrow({
+      where: { id: targetAccountId, userId, status: 'connected' }
+    })
+
+    // Check if accounts are locked
+    if (sourceAccount.lockedAt || targetAccount.lockedAt) {
+      throw new Error('Source or target account is locked by another operation.')
+    }
+
+    // Create migration session in a transaction
+    const migration = await prisma.$transaction(async (tx) => {
+      // Lock accounts
+      await tx.connectedAccount.updateMany({
+        where: { id: { in: [sourceAccountId, targetAccountId] } },
+        data: { lockedAt: new Date() }
+      })
+
+      // Create migration session
+      return tx.migrationSession.create({
+        data: {
+          userId,
+          sourceAccountId,
+          targetAccountId,
+          status: 'pending',
+          transactionId: `tx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        }
+      })
+    })
+
+    // Start scan
+    await this.startScan(migration.id, userId)
+    return migration
+  }
+
+  /**
+   * Start scan for migration
+   */
+  async startScan(migrationId: string, userId: string) {
+    const migration = await prisma.migrationSession.findFirstOrThrow({
+      where: { id: migrationId, userId, status: 'pending' }
+    })
+
+    await prisma.migrationSession.update({
+      where: { id: migrationId },
+      data: { status: 'scanning', startedAt: new Date() }
+    })
+
+    // Enqueue scan job
+    await migrationQueue.enqueue(migrationId, 'scan', async (signal) => {
+      try {
+        const scanner = new ScannerService()
+        await scanner.scanSource(migrationId, migration.sourceAccountId, userId, signal)
+        emit(migrationId, { type: 'complete', data: { totalFiles: 0, completedFiles: 0, failedFiles: 0, skippedFiles: 0 } })
+      } catch (err) {
+        console.error('[MIGRATION] scan error:', err)
+        await prisma.migrationSession.update({
+          where: { id: migrationId },
+          data: { status: 'failed', errorMessage: err instanceof Error ? err.message : 'Scan failed' }
+        })
+        throw err
+      }
+    })
+  }
+
   /**
    * Pause a running migration
    */
@@ -99,11 +166,11 @@ export class MigrationService {
 
     const percentComplete =
       migration.totalFiles > 0
-        ? Math.round(
+        ? Math.min(100, Math.round(
             ((migration.completedFiles + migration.failedFiles + migration.skippedFiles) /
               migration.totalFiles) *
               100
-          )
+          ))
         : 0
 
     return {
@@ -164,7 +231,7 @@ export class MigrationService {
       migratedBytes: m.migratedBytes.toString(),
       percentComplete:
         m.totalFiles > 0
-          ? Math.round(((m.completedFiles + m.failedFiles + m.skippedFiles) / m.totalFiles) * 100)
+          ? Math.min(100, Math.round(((m.completedFiles + m.failedFiles + m.skippedFiles) / m.totalFiles) * 100))
           : 0
     }))
   }
@@ -177,23 +244,14 @@ export class MigrationService {
       where: { id: migrationId, userId }
     })
 
-    const skip = (page - 1) * limit
-    const [items, total] = await Promise.all([
-      prisma.migrationItem.findMany({
-        where: { migrationId },
-        orderBy: { createdAt: 'asc' },
-        skip,
-        take: limit
-      }),
-      prisma.migrationItem.count({ where: { migrationId } })
-    ])
+    const result = await scanResultService.getByMigration(migrationId, { page, limit })
 
     return {
-      items: items.map((i) => ({ ...i, sizeBytes: i.sizeBytes.toString() })),
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit)
+      items: result.items.map((i: any) => ({ ...i, sizeBytes: i.sizeBytes })),
+      total: result.total,
+      page: result.page,
+      limit: result.limit,
+      totalPages: result.totalPages
     }
   }
 
@@ -205,15 +263,12 @@ export class MigrationService {
       where: {
         id: migrationId,
         userId,
-        status: { in: ['completed', 'failed'] }
+        status: { in: ['completed', 'completed_with_errors', 'failed'] }
       }
     })
 
     // Reset failed items to selected
-    await prisma.migrationItem.updateMany({
-      where: { migrationId, status: 'failed' },
-      data: { status: 'selected', errorMessage: null, retryCount: 0 }
-    })
+    await scanResultService.resetFailedToSelected(migrationId)
 
     // Update session status
     await prisma.migrationSession.update({
@@ -242,7 +297,7 @@ export class MigrationService {
         }
       })
 
-      setTimeout(() => subscribers.delete(migrationId), 30_000)
+      setTimeout(() => { /* Redis subscription auto-cleans on unsubscribe */ }, 30_000)
     })
 
     return { status: 'ok' }
@@ -256,15 +311,13 @@ export class MigrationService {
       where: { id: migrationId, userId, status: 'scanned' }
     })
 
-    const selectedItems = await prisma.migrationItem.findMany({
-      where: { migrationId, status: 'selected' }
-    })
+    const selectedItems = await scanResultService.getSelectedItems(migrationId)
 
     if (selectedItems.length === 0) {
       throw Object.assign(new Error('No items selected.'), { status: 400 })
     }
 
-    const selectedBytes = selectedItems.reduce((sum, i) => sum + i.sizeBytes, 0n)
+    const selectedBytes = selectedItems.reduce((sum, i) => sum + BigInt(i.size), 0n)
 
     // Auto-select ancestor folders
     const ancestorIds = new Set<string>()
@@ -273,31 +326,24 @@ export class MigrationService {
       while (parentId) {
         if (ancestorIds.has(parentId)) break
         ancestorIds.add(parentId)
-        const parent = await prisma.migrationItem.findFirst({
-          where: { migrationId, sourceFileId: parentId }
-        })
-        parentId = parent?.sourceParentId ?? null
+        const parent = await scanResultService.getBySourceFileIds(migrationId, [parentId])
+        parentId = parent[0]?.sourceParentId ?? null
       }
     }
 
     if (ancestorIds.size > 0) {
-      await prisma.migrationItem.updateMany({
-        where: {
-          migrationId,
-          sourceFileId: { in: Array.from(ancestorIds) },
-          isFolder: true,
-          status: 'pending'
-        },
-        data: { status: 'selected' }
-      })
+      await scanResultService.updateManyStatus(
+        migrationId,
+        Array.from(ancestorIds),
+        'selected',
+        { type: 'folder' }
+      )
     }
 
     // Count final selection
-    const allSelected = await prisma.migrationItem.findMany({
-      where: { migrationId, status: 'selected' }
-    })
-    const selectedFolders = allSelected.filter((i) => i.isFolder)
-    const selectedFiles = allSelected.filter((i) => !i.isFolder)
+    const allSelected = await scanResultService.getSelectedItems(migrationId)
+    const selectedFolders = allSelected.filter((i) => i.type === 'folder')
+    const selectedFiles = allSelected.filter((i) => i.type === 'file')
 
     // Update session
     await prisma.migrationSession.update({
@@ -313,26 +359,31 @@ export class MigrationService {
 
     // Enqueue transfer job
     await migrationQueue.enqueue(migrationId, 'transfer', async (signal, isPaused) => {
-      const result = await transferService.executeMigration(
-        migrationId,
-        userId,
-        signal,
-        isPaused
-      )
+      try {
+        const result = await transferService.executeMigration(
+          migrationId,
+          userId,
+          signal,
+          isPaused
+        )
 
-      syncGoogleQuota(migration.targetAccountId).catch(() => undefined)
+        syncGoogleQuota(migration.targetAccountId).catch(() => undefined)
 
-      emit(migrationId, {
-        type: 'complete',
-        data: {
-          totalFiles: result.totalFiles,
-          completedFiles: result.completedFiles,
-          failedFiles: result.failedFiles,
-          skippedFiles: result.skippedFiles
-        }
-      })
+        emit(migrationId, {
+          type: 'complete',
+          data: {
+            totalFiles: result.totalFiles,
+            completedFiles: result.completedFiles,
+            failedFiles: result.failedFiles,
+            skippedFiles: result.skippedFiles
+          }
+        })
 
-      setTimeout(() => subscribers.delete(migrationId), 30_000)
+        setTimeout(() => { /* Redis subscription auto-cleans on unsubscribe */ }, 30_000)
+      } catch (err) {
+        console.error('[MIGRATION] transfer error:', err)
+        throw err
+      }
     })
 
     return migration
@@ -346,11 +397,9 @@ export class MigrationService {
       where: { id: migrationId, userId, status: 'scanned' }
     })
 
-    const selectedItems = await prisma.migrationItem.findMany({
-      where: { migrationId, status: 'selected' }
-    })
+    const selectedItems = await scanResultService.getSelectedItems(migrationId)
 
-    const totalBytes = selectedItems.reduce((sum, i) => sum + i.sizeBytes, 0n)
+    const totalBytes = selectedItems.reduce((sum, i) => sum + BigInt(i.size), 0n)
 
     // Get available quota for target account
     const targetAccount = await prisma.connectedAccount.findUnique({

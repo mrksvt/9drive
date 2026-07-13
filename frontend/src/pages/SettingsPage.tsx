@@ -38,6 +38,7 @@ export function SettingsPage() {
   const [s3Form, setS3Form] = useState({ name: '', bucket: '', region: 'us-east-1', endpoint: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: false, quotaBytes: '' })
   const [syncingAccountId, setSyncingAccountId] = useState<string | null>(null)
   const [disconnectingAccountId, setDisconnectingAccountId] = useState<string | null>(null)
+  const [confirmingAccountId, setConfirmingAccountId] = useState<string | null>(null)
   const [accountToDisconnect, setAccountToDisconnect] = useState<ConnectedAccount | null>(null)
   const [profileImageUrl, setProfileImageUrl] = useState('')
   const [selectedAccountId, setSelectedAccountId] = useState('')
@@ -180,8 +181,27 @@ export function SettingsPage() {
                 <label className="grid gap-2 text-sm font-semibold">Choose Account<select className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm" value={selectedAccount?.id ?? ''} onChange={(event) => setSelectedAccountId(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{providerLabel(account.provider)} - {account.displayName || account.email} ({account.status})</option>)}</select></label>
                 {selectedAccount ? <div className="rounded-xl bg-slate-50 p-4">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="min-w-0"><p className="break-all font-semibold">{selectedAccount.displayName || selectedAccount.email}</p><p className="text-sm text-slate-500">{providerLabel(selectedAccount.provider)} · {selectedAccount.status}</p></div>
-                    <div className="grid grid-cols-2 gap-2 sm:flex"><Button className="w-full" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button><Button className="w-full" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
+                    <div className="min-w-0">
+                      <p className="break-all font-semibold">{selectedAccount.displayName || selectedAccount.email}</p>
+                      <p className="text-sm text-slate-500">{providerLabel(selectedAccount.provider)} · {selectedAccount.status}</p>
+                      {selectedAccount.provider === 'google_drive' && !selectedAccount.confirmedAt && (
+                        <p className="mt-1 text-xs font-semibold text-yellow-600">⚠️ You haven't confirmed full access. Some features may not work.</p>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 sm:flex">
+                      {selectedAccount.provider === 'google_drive' && !selectedAccount.confirmedAt && (
+                        <Button className="w-full" variant="default" onClick={() => confirmAccount(selectedAccount.id)} disabled={confirmingAccountId === selectedAccount.id}>
+                          {confirmingAccountId === selectedAccount.id ? 'Confirming...' : 'Confirm Full Access'}
+                        </Button>
+                      )}
+                      <Button className="w-full" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}>
+                        <RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
+                        {syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}
+                      </Button>
+                      <Button className="w-full" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}>
+                        <Trash2 className="h-4 w-4" />Disconnect
+                      </Button>
+                    </div>
                   </div>
                   <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs sm:text-sm">
                     <div className="rounded-xl bg-white p-3"><p className="font-extrabold text-slate-950">{formatBytes(selectedAccount.storageAccount?.usedBytes)}</p><p className="mt-1 text-slate-500">Used</p></div>

@@ -84,9 +84,13 @@ export type MigrationItem = {
   retryCount: number
 }
 
-export function streamScan(sourceAccountId: string, onEvent: (event: { type: string; data: Record<string, unknown> }) => void): EventSource {
+export function streamScan(sourceAccountId: string, onEvent: (event: { type: string; data: Record<string, unknown> }) => void, force = false): EventSource {
   const token = getAccessToken()
-  const url = `${API_URL}/migrations/scan/${sourceAccountId}/stream${token ? `?token=${token}` : ''}`
+  const params = new URLSearchParams()
+  if (token) params.set('token', token)
+  if (force) params.set('force', 'true')
+  const qs = params.toString()
+  const url = `${API_URL}/migrations/scan/${sourceAccountId}/stream${qs ? `?${qs}` : ''}`
   const es = new EventSource(url)
   let completed = false
 

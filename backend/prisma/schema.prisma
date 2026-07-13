@@ -149,6 +149,8 @@ model ConnectedAccount {
   scopes                Json
   status                String             @default("connected") @db.VarChar(32)
   lastError             String?            @map("last_error") @db.Text
+  confirmedAt           DateTime?          @map("confirmed_at")
+  lockedAt              DateTime?          @map("locked_at")
   createdAt             DateTime           @default(now()) @map("created_at")
   updatedAt             DateTime           @updatedAt @map("updated_at")
   user                  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -237,16 +239,17 @@ model File {
 }
 
 model FileShare {
-  id        String    @id @default(uuid()) @db.Char(36)
-  fileId    String    @map("file_id") @db.Char(36)
-  userId    String    @map("user_id") @db.Char(36)
-  token     String?   @unique @db.VarChar(191)
-  tokenHash String    @unique @map("token_hash") @db.VarChar(255)
-  enabled   Boolean   @default(true)
-  expiresAt DateTime? @map("expires_at")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
-  file      File      @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  id           String    @id @default(uuid()) @db.Char(36)
+  fileId       String    @map("file_id") @db.Char(36)
+  userId       String    @map("user_id") @db.Char(36)
+  token        String?   @unique @db.VarChar(191)
+  tokenHash    String    @unique @map("token_hash") @db.VarChar(255)
+  passwordHash String?   @map("password_hash") @db.VarChar(255)
+  enabled      Boolean   @default(true)
+  expiresAt    DateTime? @map("expires_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  file         File      @relation(fields: [fileId], references: [id], onDelete: Cascade)
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([fileId])
@@ -352,6 +355,7 @@ model WorkspaceInvite {
 
 model MigrationSession {
   id              String           @id @default(uuid()) @db.Char(36)
+  transactionId   String?          @unique @map("transaction_id")
   userId          String           @map("user_id") @db.Char(36)
   sourceAccountId String           @map("source_account_id") @db.Char(36)
   targetAccountId String           @map("target_account_id") @db.Char(36)
@@ -365,6 +369,7 @@ model MigrationSession {
   migratedBytes   BigInt           @default(0) @map("migrated_bytes")
   errorMessage    String?          @map("error_message") @db.Text
   cursor          Json?
+  lockedAt        DateTime?        @map("locked_at")
   startedAt       DateTime?        @map("started_at")
   completedAt     DateTime?        @map("completed_at")
   createdAt       DateTime         @default(now()) @map("created_at")
@@ -389,6 +394,7 @@ model MigrationItem {
   name           String           @db.VarChar(255)
   mimeType       String           @map("mime_type") @db.VarChar(191)
   sizeBytes      BigInt           @map("size_bytes")
+  checksum       String?          @db.VarChar(191)
   isFolder       Boolean          @default(false) @map("is_folder")
   status         String           @default("pending") @db.VarChar(32)
   targetFileId   String?          @map("target_file_id") @db.VarChar(191)

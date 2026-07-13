@@ -1,9 +1,11 @@
 import { Router } from 'express'
 import { google } from 'googleapis'
+import { Types } from 'mongoose'
 import { z } from 'zod'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
+import { fileMetadataService } from '../mongodb/file-metadata.service.js'
 
 export const folderRouter = Router()
 folderRouter.use(requireAuth)
@@ -61,6 +63,19 @@ folderRouter.post('/', async (req: AuthRequest, res, next) => {
       data: { userId: req.user!.id, name: body.name, color: body.color ?? defaultFolderColor, iconUrl: body.iconUrl ?? defaultFolderIconUrl, parentId: body.parentId ?? null },
       select: { id: true, name: true, color: true, iconUrl: true, parentId: true, createdAt: true, updatedAt: true },
     })
+    // Write to MongoDB (fire-and-forget)
+    fileMetadataService.create({
+      userId: req.user!.id,
+      connectedAccountId: folder.id,
+      name: folder.name,
+      type: 'folder',
+      parentId: folder.parentId ? new Types.ObjectId(folder.parentId) : null,
+      path: folder.parentId ? `/${folder.parentId}/${folder.name}` : `/${folder.name}`,
+      mimeType: 'inode/directory',
+      size: 0n,
+      storage: { provider: folder.parentId ? 'google_drive' as const : 'google_drive' as const },
+      starred: false,
+    }).catch(err => console.error('[MongoDB] folder metadata write failed:', err.message))
     return res.status(201).json({ folder: serializeFolder(folder) })
   } catch (error) {
     return next(error)
@@ -99,6 +114,13 @@ folderRouter.patch('/:id', async (req: AuthRequest, res, next) => {
       where: { id: folderId, userId: req.user!.id },
       select: { id: true, name: true, color: true, iconUrl: true, parentId: true, createdAt: true, updatedAt: true },
     })
+    // Update MongoDB metadata for rename/move (fire-and-forget)
+    const newPath = updated.parentId ? `/${updated.parentId}/${updated.name}` : `/${updated.name}`
+    fileMetadataService.update(updated.id, {
+      name: updated.name,
+      parentId: updated.parentId ? new Types.ObjectId(updated.parentId) : null,
+      path: newPath,
+    }).catch(err => console.error('[MongoDB] folder metadata update failed:', err.message))
     return res.json({ folder: serializeFolder(updated) })
   } catch (error) {
     return next(error)
@@ -137,6 +159,10 @@ folderRouter.delete('/:id', async (req: AuthRequest, res, next) => {
 
     await prisma.file.updateMany({ where: { id: { in: files.map((file) => file.id) } }, data: { status: 'deleted', deletedAt: new Date() } })
     await prisma.folder.updateMany({ where: { id: { in: [...folderIds] }, userId: req.user!.id }, data: { deletedAt: new Date() } })
+    // Soft-delete MongoDB metadata for folders (fire-and-forget)
+    folderIds.forEach(async folderId => {
+      fileMetadataService.softDelete(folderId).catch(err => console.error('[MongoDB] folder metadata soft-delete failed:', err.message))
+    })
     for (const accountId of syncedAccountIds) await syncGoogleQuota(accountId).catch(() => undefined)
     return res.json({ status: 'ok' })
   } catch (error) {

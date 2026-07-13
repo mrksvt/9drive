@@ -295,6 +295,19 @@ connectedAccountRouter.post('/:id/sync-quota', requireAuth, async (req: AuthRequ
   }
 })
 
+connectedAccountRouter.post('/:id/confirm', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const accountId = String(req.params.id)
+    const account = await prisma.connectedAccount.update({
+      where: { id: accountId, userId: req.user!.id },
+      data: { confirmedAt: new Date() }
+    })
+    return res.json({ status: 'ok', account: { ...account, confirmed: true } })
+  } catch (error) {
+    return next(error)
+  }
+})
+
 connectedAccountRouter.delete('/:id', requireAuth, async (req: AuthRequest, res, next) => {
   try {
     const accountId = String(req.params.id)

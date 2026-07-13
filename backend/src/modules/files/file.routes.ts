@@ -63,6 +63,7 @@ fileRouter.get('/', async (req: AuthRequest, res, next) => {
       }
     }
     
+    // TODO: switch to MongoDB primary after validation
     const files = await prisma.file.findMany({ where: { userId: req.user!.id, status: 'active', mimeType: { not: googleDriveFolderMimeType }, ...(query.folderId ? { folderId: query.folderId } : {}), ...(query.q ? { name: { contains: query.q } } : {}) }, include: { connectedAccount: { select: { id: true, email: true, provider: true } }, folder: { select: { id: true, name: true } } }, orderBy: { createdAt: 'desc' } })
     const mappedFiles = files.map((file) => ({ ...file, sizeBytes: file.sizeBytes.toString() }))
     const grouped = groupFilesByExtension(files as unknown as BackendFile[])
@@ -174,6 +175,7 @@ fileRouter.post('/sync-google', async (req: AuthRequest, res, next) => {
 fileRouter.get('/:id', async (req: AuthRequest, res, next) => {
   try {
     const fileId = String(req.params.id)
+    // TODO: switch to MongoDB primary after validation
     const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id }, include: { connectedAccount: { select: { id: true, email: true, provider: true } }, folder: { select: { id: true, name: true } } } })
     return res.json({ file: { ...file, sizeBytes: file.sizeBytes.toString() } })
   } catch (error) {
@@ -196,15 +198,36 @@ fileRouter.patch('/:id', async (req: AuthRequest, res, next) => {
   }
 })
 
+const shareFileSchema = z.object({
+  password: z.string().min(1).max(255).optional(),
+})
+
 fileRouter.post('/:id/share', async (req: AuthRequest, res, next) => {
   try {
     const fileId = String(req.params.id)
+    const body = shareFileSchema.parse(req.body)
     const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id, status: 'active' } })
     const existingShare = await prisma.fileShare.findFirst({ where: { fileId: file.id, userId: req.user!.id, enabled: true, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }, orderBy: { createdAt: 'desc' } })
-    if (existingShare?.token) return res.json({ url: `${env.FRONTEND_URL}/public/files/${existingShare.token}`, shareId: existingShare.id })
+    if (existingShare?.token) {
+      if (body.password) {
+        await prisma.fileShare.update({
+          where: { id: existingShare.id },
+          data: { passwordHash: await hashPassword(body.password) }
+        })
+      }
+      return res.json({ url: `${env.FRONTEND_URL}/public/files/${existingShare.token}`, shareId: existingShare.id })
+    }
     if (existingShare) await prisma.fileShare.update({ where: { id: existingShare.id }, data: { enabled: false } })
     const token = randomToken(32)
-    const share = await prisma.fileShare.create({ data: { fileId: file.id, userId: req.user!.id, token, tokenHash: hashToken(token) } })
+    const share = await prisma.fileShare.create({
+      data: {
+        fileId: file.id,
+        userId: req.user!.id,
+        token,
+        tokenHash: hashToken(token),
+        ...(body.password ? { passwordHash: await hashPassword(body.password) } : {})
+      }
+    })
     return res.status(201).json({ url: `${env.FRONTEND_URL}/public/files/${token}`, shareId: share.id })
   } catch (error) {
     return next(error)

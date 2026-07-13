@@ -2,6 +2,7 @@ import Busboy from 'busboy'
 import type { NextFunction, Response } from 'express'
 import { Router } from 'express'
 import { google } from 'googleapis'
+import { Types } from 'mongoose'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
@@ -9,6 +10,7 @@ import { createRequestLogger } from '../../utils/logger.js'
 import { sanitizeFileName } from '../../utils/sanitize.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
+import { fileMetadataService } from '../mongodb/file-metadata.service.js'
 
 export const uploadRouter = Router()
 
@@ -175,6 +177,19 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           providerFileId = buildS3ObjectKey(config, req.user!.id, provisionalFile.id, fileName)
           await uploadS3Object(config, providerFileId, fileStream, meta.mimeType)
           await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
+          // Write to MongoDB (fire-and-forget)
+          fileMetadataService.create({
+            userId: req.user!.id,
+            connectedAccountId: account.id,
+            name: fileName,
+            type: 'file',
+            parentId: folderId ? new Types.ObjectId(folderId) : null,
+            path: folderId ? `/${folderId}/${fileName}` : `/${fileName}`,
+            extension: fileName.includes('.') ? fileName.split('.').pop()?.toLowerCase() : undefined,
+            mimeType: meta.mimeType,
+            size: meta.sizeBytes,
+            storage: { provider: 's3', bucket: config.bucket, objectKey: providerFileId, providerFileId },
+          }).catch(err => logUpload('mongodb file metadata write failed', { fileName, message: err instanceof Error ? err.message : 'Unknown error' }))
           completed.push({ ...provisionalFile, providerFileId, status: 'active', sizeBytes: provisionalFile.sizeBytes.toString() })
           logUpload('s3 upload completed', { sessionId: session.id, accountId: account.id, fileName })
         } else {
@@ -213,6 +228,19 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         const file = account.provider === 's3' ? null : await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'google_drive', providerFileId, name: uploadedName, mimeType: uploadedMimeType, sizeBytes: meta.sizeBytes } })
         if (file) {
           logUpload('database file created', { sessionId: session.id, fileId: file.id, accountId: account.id })
+          // Write to MongoDB (fire-and-forget)
+          fileMetadataService.create({
+            userId: req.user!.id,
+            connectedAccountId: account.id,
+            name: uploadedName,
+            type: 'file',
+            parentId: folderId ? new Types.ObjectId(folderId) : null,
+            path: folderId ? `/${folderId}/${uploadedName}` : `/${uploadedName}`,
+            extension: uploadedName.includes('.') ? uploadedName.split('.').pop()?.toLowerCase() : undefined,
+            mimeType: uploadedMimeType,
+            size: meta.sizeBytes,
+            storage: { provider: 'google_drive', providerFileId },
+          }).catch(err => logUpload('mongodb file metadata write failed', { fileName: uploadedName, message: err instanceof Error ? err.message : 'Unknown error' }))
           completed.push({ ...file, sizeBytes: file.sizeBytes.toString() })
         }
         await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'completed', completedAt: new Date() } })

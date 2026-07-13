@@ -93,6 +93,7 @@ export class DatabaseMigrationQueue {
         })
         .catch(async (error) => {
           const msg = error instanceof Error ? error.message : 'Job failed'
+          console.error('[MIGRATION-QUEUE] job failed:', jobId, msg, error instanceof Error ? error.stack : '')
           await prisma.migrationJob.update({
             where: { id: jobId },
             data: {

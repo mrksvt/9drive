@@ -32,24 +32,34 @@ async function createSession(userId: string, req: AuthRequest) {
 }
 
 async function verifyCaptcha(token: string | undefined) {
-  if (!env.RECAPTCHA_SECRET_KEY) return true
-  if (!token) return false
+  if (!env.RECAPTCHA_SECRET_KEY) {
+    throw new Error('reCAPTCHA is not configured. Set RECAPTCHA_SECRET_KEY in env.')
+  }
+  if (!token) {
+    throw new Error('Captcha token is required.')
+  }
   const form = new URLSearchParams({ secret: env.RECAPTCHA_SECRET_KEY, response: token })
   const response = await fetch('https://www.google.com/recaptcha/api/siteverify', { method: 'POST', body: form })
   const data = await response.json() as { success?: boolean }
-  return Boolean(data.success)
+  if (!data.success) {
+    throw new Error('Captcha verification failed.')
+  }
+  return true
 }
 
 authRouter.post('/register', async (req, res, next) => {
   try {
     const body = registerSchema.parse(req.body)
-    if (!(await verifyCaptcha(body.captchaToken))) return res.status(400).json({ code: 'CAPTCHA_FAILED', message: 'Captcha verification failed.' })
+    await verifyCaptcha(body.captchaToken)
     const existing = await prisma.user.findUnique({ where: { email: body.email } })
     if (existing) return res.status(409).json({ code: 'AUTH_EMAIL_TAKEN', message: 'Email already registered.' })
     const user = await prisma.user.create({ data: { name: body.name, email: body.email, passwordHash: await hashPassword(body.password) } })
     const tokens = await createSession(user.id, req)
     return res.status(201).json({ ...tokens, user: { id: user.id, name: user.name, email: user.email } })
   } catch (error) {
+    if (error instanceof Error && error.message.includes('Captcha')) {
+      return res.status(400).json({ code: 'CAPTCHA_FAILED', message: error.message })
+    }
     return next(error)
   }
 })
@@ -128,6 +138,7 @@ authRouter.get('/google/callback', async (req, res) => {
         tokenExpiresAt: new Date(tokens.expiry_date ?? Date.now() + 3600_000),
         scopes: oauthState.providerConfig.scopes as string[],
         status: 'connected',
+        confirmedAt: null, // Not confirmed yet
       },
       update: {
         providerConfigId: oauthState.providerConfigId,
@@ -139,6 +150,7 @@ authRouter.get('/google/callback', async (req, res) => {
         tokenExpiresAt: new Date(tokens.expiry_date ?? Date.now() + 3600_000),
         scopes: oauthState.providerConfig.scopes as string[],
         status: 'connected',
+        confirmedAt: null, // Reset on re-connect
       },
     })
 

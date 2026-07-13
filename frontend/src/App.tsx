@@ -35,7 +35,7 @@ function App() {
           <Route path="starred" element={<StarredPage />} />
           <Route path="archived" element={<ArchivedPage />} />
           <Route path="settings" element={<SettingsPage />} />
-          <Route path="api" element={<ApiManagementPage />} />
+          <Route path="endpoint" element={<ApiManagementPage />} />
           <Route path="migration" element={<MigrationPage />} />
         </Route>
       </Route>
